@@ -23,6 +23,8 @@ struct llama_graph_exec_log_session {
 };
 
 llama_graph_exec_log_session g_session;
+thread_local int g_node_done_suppression = 0;
+thread_local bool g_current_node_fallback = false;
 
 static bool env_enabled(void) {
     static std::atomic<int> cached {-1};
@@ -44,7 +46,7 @@ static bool env_enabled(void) {
     return value == 1;
 }
 
-static void write_node_log(const struct ggml_tensor * node, double elapsed_ms) {
+static void write_node_log(const struct ggml_tensor * node, double elapsed_ms, bool fallback) {
     if (node == nullptr) {
         return;
     }
@@ -53,7 +55,7 @@ static void write_node_log(const struct ggml_tensor * node, double elapsed_ms) {
 
     std::fprintf(
             g_session.file,
-            "seq=%" PRIu64 " op=%s name=%s type=%s shape=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] contiguous: %s time elapsed: %.3fms\n",
+            "seq=%" PRIu64 " op=%s name=%s type=%s shape=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] contiguous: %s fallback: %s time-elapsed: %.3fms\n",
             seq,
             ggml_op_name(node->op),
             node->name[0] != '\0' ? node->name : "<unnamed>",
@@ -63,6 +65,7 @@ static void write_node_log(const struct ggml_tensor * node, double elapsed_ms) {
             (int64_t) node->ne[2],
             (int64_t) node->ne[3],
             ggml_is_contiguous(node) ? "true" : "false",
+            fallback ? "true" : "false",
             elapsed_ms);
 
     for (int j = 0; j < GGML_MAX_SRC; j++) {
@@ -185,8 +188,13 @@ static void exec_log_node_done(
         int64_t elapsed_us,
         void * user_data) {
     GGML_UNUSED(user_data);
+    GGML_UNUSED(backend);
 
     if (!g_session.enabled || g_session.file == nullptr || cgraph == nullptr) {
+        return;
+    }
+
+    if (g_node_done_suppression > 0) {
         return;
     }
 
@@ -200,10 +208,10 @@ static void exec_log_node_done(
     }
 
     const double elapsed_ms = elapsed_us / 1000.0;
+    const bool fallback = g_current_node_fallback;
 
     std::lock_guard<std::mutex> lock(g_session.mutex);
-    GGML_UNUSED(backend);
-    write_node_log(node, elapsed_ms);
+    write_node_log(node, elapsed_ms, fallback);
 }
 
 } // namespace
@@ -241,4 +249,22 @@ void llama_graph_exec_log_prepare(ggml_backend_reg_t * regs, size_t n_regs) {
         ggml_backend_set_graph_node_done_callback(exec_log_node_done, nullptr);
     });
 
+}
+
+void llama_graph_exec_log_suspend_node_done(void) {
+    ++g_node_done_suppression;
+}
+
+void llama_graph_exec_log_resume_node_done(void) {
+    if (g_node_done_suppression > 0) {
+        --g_node_done_suppression;
+    }
+}
+
+void llama_graph_exec_log_set_current_node_fallback(bool fallback) {
+    g_current_node_fallback = fallback;
+}
+
+bool llama_graph_exec_log_current_node_is_fallback(void) {
+    return g_current_node_fallback;
 }

@@ -3,6 +3,7 @@
 #include "ggml-awnpu-exec-log-resolver.h"
 #include "ggml-awnpu-layer-map.h"
 #include "ggml-awnpu-ops.h"
+#include "llama-graph-exec-log.h"
 #include "ggml-backend-impl.h"
 #include "ggml-cpu.h"
 #include "ggml-impl.h"
@@ -20,7 +21,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
-#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #if !defined(_WIN32)
@@ -144,6 +145,18 @@ static bool ggml_backend_awnpu_sim_enabled(void) {
     return value == 1;
 }
 
+static bool ggml_backend_awnpu_sim_probe_enabled(void) {
+    static std::atomic<int> cached {-1};
+
+    int value = cached.load(std::memory_order_acquire);
+    if (value == -1) {
+        value = ggml_backend_awnpu_parse_bool_env("SIM_PROBE", false) ? 1 : 0;
+        cached.store(value, std::memory_order_release);
+    }
+
+    return value == 1;
+}
+
 static int ggml_backend_awnpu_parse_int_env(const char * name, int def) {
     const char * env = std::getenv(name);
     if (env == nullptr || *env == '\0') {
@@ -157,6 +170,50 @@ static int ggml_backend_awnpu_parse_int_env(const char * name, int def) {
     }
 
     return (int) value;
+}
+
+static std::string ggml_backend_awnpu_fallback_warning_key(const struct ggml_tensor * node) {
+    GGML_ASSERT(node != nullptr);
+
+    std::string key = ggml_op_name(node->op);
+    key += '|';
+    key += node->name;
+    key += '|';
+    key += std::to_string((int64_t) node->ne[0]);
+    key += 'x';
+    key += std::to_string((int64_t) node->ne[1]);
+    key += 'x';
+    key += std::to_string((int64_t) node->ne[2]);
+    key += 'x';
+    key += std::to_string((int64_t) node->ne[3]);
+    return key;
+}
+
+static bool ggml_backend_awnpu_warn_fallback_once(
+        const char * func_name,
+        const struct ggml_tensor * node,
+        bool sim_enabled) {
+    GGML_ASSERT(node != nullptr);
+    GGML_ASSERT(func_name != nullptr);
+
+    static std::mutex mutex;
+    static std::unordered_set<std::string> seen;
+
+    const std::string key = ggml_backend_awnpu_fallback_warning_key(node);
+
+    std::lock_guard<std::mutex> lock(mutex);
+    const bool inserted = seen.insert(key).second;
+    if (inserted) {
+        if (sim_enabled) {
+            GGML_LOG_WARN("%s: AWNPU op %s (%s) is not implemented, fallback to CPU\n",
+                    func_name, ggml_op_name(node->op), node->name);
+        } else {
+            GGML_LOG_WARN("%s: non-sim AWNPU execution is not implemented for op %s (%s), fallback to CPU\n",
+                    func_name, ggml_op_name(node->op), node->name);
+        }
+    }
+
+    return inserted;
 }
 
 extern const struct ggml_backend_buffer_i ggml_backend_awnpu_buffer_i;
@@ -223,6 +280,10 @@ static bool ggml_backend_awnpu_probe_simulated(ggml_backend_awnpu_probe_info * i
 
 static bool ggml_backend_awnpu_probe(ggml_backend_awnpu_probe_info * info) {
     GGML_ASSERT(info != nullptr);
+
+    if (ggml_backend_awnpu_sim_probe_enabled()) {
+        return ggml_backend_awnpu_probe_simulated(info);
+    }
 
     if (ggml_backend_awnpu_sim_enabled()) {
         return ggml_backend_awnpu_probe_simulated(info);
@@ -707,10 +768,6 @@ static bool ggml_backend_awnpu_device_supports_op(ggml_backend_dev_t dev, const 
         return true;
     }
 
-    if (!ggml_backend_awnpu_op_supported(op->op)) {
-        return false;
-    }
-
     if (op->op == GGML_OP_GET_ROWS) {
         const struct ggml_tensor * rows = op->src[0];
         if (rows == nullptr) {
@@ -739,6 +796,10 @@ static bool ggml_backend_awnpu_device_supports_op(ggml_backend_dev_t dev, const 
     const int il = ggml_backend_awnpu_infer_layer_index(op);
     if (il >= 0) {
         return ggml_backend_awnpu_layer_on_npu(il);
+    }
+
+    if (!ggml_backend_awnpu_op_supported(op->op)) {
+        return ggml_backend_awnpu_node_runs_on_npu(op, 0);
     }
 
     return false;
@@ -1005,12 +1066,7 @@ static enum ggml_status ggml_backend_awnpu_compute_node_npu(
     GGML_ASSERT(node != nullptr);
     GGML_UNUSED(cplan);
 
-    if (!ggml_backend_awnpu_op_supported(node->op)) {
-        GGML_LOG_ERROR("%s: unsupported AWNPU op %s (%s)\n", __func__, ggml_op_name(node->op), node->name);
-        return GGML_STATUS_FAILED;
-    }
-
-    if (ctx->sim_enabled) {
+    if (ctx->sim_enabled && ggml_backend_awnpu_op_supported(node->op)) {
         return ggml_backend_awnpu_compute_node_sim_op(
                 ctx,
                 &ggml_backend_awnpu_sim_op_dispatch,
@@ -1019,7 +1075,16 @@ static enum ggml_status ggml_backend_awnpu_compute_node_npu(
                 node);
     }
 
-    return ggml_backend_awnpu_compute_node_op(ctx, node);
+    ggml_backend_awnpu_warn_fallback_once(__func__, node, ctx->sim_enabled);
+    llama_graph_exec_log_set_current_node_fallback(true);
+
+    llama_graph_exec_log_suspend_node_done();
+    const enum ggml_status status = ggml_backend_awnpu_cpu_forward_range(ctx, cgraph, node_idx, node_idx + 1);
+    llama_graph_exec_log_resume_node_done();
+    if (status == GGML_STATUS_SUCCESS) {
+        ctx->sim_last_node_idx = node_idx + 1;
+    }
+    return status;
 }
 
 static enum ggml_status ggml_backend_awnpu_graph_compute_npu(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
@@ -1035,6 +1100,8 @@ static enum ggml_status ggml_backend_awnpu_graph_compute_npu(ggml_backend_t back
 
     enum ggml_status status = GGML_STATUS_SUCCESS;
     for (int i = 0; i < cgraph->n_nodes; ++i) {
+        llama_graph_exec_log_set_current_node_fallback(false);
+
         struct ggml_tensor * node = cgraph->nodes[i];
         if (node == nullptr) {
             continue;
@@ -1042,7 +1109,7 @@ static enum ggml_status ggml_backend_awnpu_graph_compute_npu(ggml_backend_t back
 
         if (ggml_backend_awnpu_node_is_layout_only(node)) {
             if (log_nodes) {
-                ggml_backend_invoke_graph_node_done_callback(NULL, cgraph, i, 0);
+                ggml_backend_invoke_graph_node_done_callback(backend, cgraph, i, 0);
             }
             continue;
         }
@@ -1055,8 +1122,10 @@ static enum ggml_status ggml_backend_awnpu_graph_compute_npu(ggml_backend_t back
         status = ggml_backend_awnpu_compute_node_npu(backend, cgraph, i, nullptr, node);
 
         if (log_nodes) {
-            ggml_backend_invoke_graph_node_done_callback(NULL, cgraph, i, ggml_time_us() - t0);
+            ggml_backend_invoke_graph_node_done_callback(backend, cgraph, i, ggml_time_us() - t0);
         }
+
+        llama_graph_exec_log_set_current_node_fallback(false);
 
         if (status != GGML_STATUS_SUCCESS) {
             break;

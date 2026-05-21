@@ -2,6 +2,7 @@
 
 #include "ggml-awnpu-exec-log-resolver.h"
 
+#include "ggml-awnpu-ops.h"
 #include "ggml-awnpu-layer-map.h"
 #include "ggml-awnpu-names.h"
 #include "ggml-awnpu.h"
@@ -93,6 +94,17 @@ static void on_graph_begin(
     ggml_backend_awnpu_build_layer_map(graph);
 }
 
+static bool is_fallback(
+        void * user_data,
+        ggml_backend_t dispatch,
+        const struct ggml_tensor * node) {
+    GGML_UNUSED(user_data);
+    GGML_UNUSED(dispatch);
+    GGML_UNUSED(node);
+
+    return llama_graph_exec_log_current_node_is_fallback();
+}
+
 } // namespace
 
 ggml_backend_awnpu_graph_split ggml_backend_awnpu_detect_graph_split(const struct ggml_cgraph * cgraph) {
@@ -138,6 +150,7 @@ const llama_graph_exec_log_callbacks * ggml_backend_awnpu_graph_exec_log_get_cal
         /* .resolve_tensor    = */ resolve_tensor,
         /* .on_graph_begin    = */ on_graph_begin,
         /* .is_layout_only    = */ is_layout_only_cb,
+        /* .is_fallback       = */ is_fallback,
     };
 
     return &callbacks;
