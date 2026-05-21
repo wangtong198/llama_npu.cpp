@@ -1,5 +1,7 @@
 #include "ggml-awnpu.h"
 
+#include "ggml-awnpu-exec-log-resolver.h"
+#include "ggml-awnpu-layer-map.h"
 #include "ggml-awnpu-ops.h"
 #include "ggml-backend-impl.h"
 #include "ggml-cpu.h"
@@ -46,6 +48,7 @@ struct ggml_backend_awnpu_device_context {
     std::string device_id;
     size_t memory_total = 0;
     size_t memory_free = 0;
+    int op_offload_min_batch_size = 1;
     ggml_backend_buffer_type_t buft = nullptr;
 };
 
@@ -56,10 +59,6 @@ struct ggml_backend_awnpu_context {
     void * work_data = nullptr;
     size_t work_size = 0;
     bool sim_enabled = false;
-    std::FILE * sim_log_file = nullptr;
-    std::string sim_log_path;
-    std::mutex sim_log_mutex;
-    uint64_t sim_node_counter = 0;
     int sim_last_node_idx = -1; // sim 增量子图执行上界（不含）
     // 图执行中的中断回调
     // 用于外部请求停止推理时，执行过程能及时退出
@@ -169,7 +168,8 @@ static enum ggml_status ggml_backend_awnpu_cpu_forward_range(
         struct ggml_cgraph * cgraph,
         int i0,
         int i1);
-static bool ggml_backend_awnpu_node_is_layout_only(const struct ggml_tensor * node);
+static bool ggml_backend_awnpu_op_has_npu_weights(const struct ggml_tensor * op);
+static bool ggml_backend_awnpu_op_has_cpu_host_weights(const struct ggml_tensor * op);
 
 static void ggml_backend_awnpu_get_host_memory(size_t * memory_free, size_t * memory_total) {
     size_t total = 8ull * 1024 * 1024 * 1024;
@@ -335,6 +335,10 @@ static void ggml_backend_awnpu_buffer_free_buffer(ggml_backend_buffer_t buffer) 
     auto * ctx = (ggml_backend_awnpu_buffer_context *) buffer->context;
     // The backing storage is host-managed. AWNPU must not release the
     // CPU-allocated memory here; it only drops the wrapper context.
+    if (ctx->owned) {
+        ggml_backend_awnpu_host_aligned_free(ctx->data);
+    }
+
     delete ctx;
 }
 
@@ -347,8 +351,14 @@ static void * ggml_backend_awnpu_buffer_get_base(ggml_backend_buffer_t buffer) {
 // 指针和布局主要由 ggml_backend_tensor_alloc / ggml_backend_view_init 及上游分配器在 CPU 上完成，
 // ggml_backend_buffer_init_tensor 只是随后调用可选的 iface.init_tensor
 static enum ggml_status ggml_backend_awnpu_buffer_init_tensor(ggml_backend_buffer_t buffer, struct ggml_tensor * tensor) {
+    if (buffer != nullptr && tensor != nullptr &&
+        ggml_backend_awnpu_buffer_name_is_npu(ggml_backend_buffer_name(buffer))) {
+        ggml_backend_awnpu_record_layer_placement(tensor, true);
+        if (ggml_backend_awnpu_is_output_weight_name(tensor->name)) {
+            ggml_backend_awnpu_set_output_on_npu(true);
+        }
+    }
     GGML_UNUSED(buffer);
-    GGML_UNUSED(tensor);
     return GGML_STATUS_SUCCESS;
 }
 
@@ -549,9 +559,8 @@ static ggml_backend_buffer_t ggml_backend_awnpu_buffer_alloc_buffer(ggml_backend
     }
 
     // 这里由 CPU/host 为 AWNPU 申请一块共享 DDR 空间，并按 NPU 要求的对齐方式分配。
-    // true 表示 buffer 自己拥有这块内存，释放 buffer 时负责回收它。
     auto * buffer_ctx = ggml_backend_awnpu_buffer_context_init(
-            ggml_backend_awnpu_host_aligned_malloc(size, alignment), size, true);
+            ggml_backend_awnpu_host_aligned_malloc(size, alignment), size, false);
     if (buffer_ctx->data == nullptr) {
         delete buffer_ctx;
         return nullptr;
@@ -573,14 +582,6 @@ static ggml_backend_buffer_type_t ggml_backend_awnpu_buffer_type_from_device(ggm
 // - 从别的库导入已有内存
 // - 避免重复拷贝
 // - 让 ggml 直接把外部内存纳入管理
-
-// 这个接口很适合：
-// - 共享内存
-// - mmap 模型文件
-// - 零拷贝场景
-// 返回的不是“重新分配的一块内存”，而是对外部内存的封装。
-
-// ptr 是 host 分配的空间地址，那么 ggml_backend_awnpu_buffer_i 接口应该是 谁 来管理 ptr 地址的，NPU 还是 CPU？
 static ggml_backend_buffer_t ggml_backend_awnpu_device_buffer_from_host_ptr(ggml_backend_dev_t dev, void * ptr, size_t size, size_t max_tensor_size) {
     GGML_UNUSED(max_tensor_size);
     auto * dev_ctx = (ggml_backend_awnpu_device_context *) dev->context;
@@ -699,17 +700,52 @@ static ggml_backend_buffer_type_t ggml_backend_awnpu_device_get_host_buffer_type
     return ggml_backend_cpu_buffer_type();
 }
 
-// 判断这个 device 是否支持某个具体 op。
-// 返回 true/false，用于调度器决定： 这个节点能不能放到这个 device 上算, 如 mul_mat、add 等
-// reshape、控制流、非常规的 OP 不被支持，为什么？
-// 对于 在 CPU + NPU 上 部署的算子，所有被依赖的 OP 都必须能被 CPU 或者 NPU 支持，所以可以直接返回 true 
+// AWNPU 接管 NPU 层（权重在 AWNPU buft）上的 op；其余由 scheduler 按 -ngl 切分与传播决定。
 static bool ggml_backend_awnpu_device_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
     GGML_UNUSED(dev);
     if (op == nullptr) {
         return false;
     }
 
-    return ggml_backend_awnpu_node_is_layout_only(op) || ggml_backend_awnpu_op_supported(op->op);
+    if (ggml_backend_awnpu_node_is_layout_only(op)) {
+        return true;
+    }
+
+    if (!ggml_backend_awnpu_op_supported(op->op)) {
+        return false;
+    }
+
+    if (op->op == GGML_OP_GET_ROWS) {
+        const struct ggml_tensor * rows = op->src[0];
+        if (rows == nullptr) {
+            return false;
+        }
+        // Input embedding lookup: always CPU (merge with CPU prefix layers).
+        if (ggml_backend_awnpu_is_input_embedding_weight(rows)) {
+            return false;
+        }
+        if (rows->buffer != nullptr &&
+            rows->buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
+            return false;
+        }
+        // Last-layer inp_out_ids / MoE row select: follow activation src.
+        return ggml_backend_awnpu_node_runs_on_npu(rows, 0);
+    }
+
+    if (ggml_backend_awnpu_op_has_npu_weights(op)) {
+        return true;
+    }
+
+    if (ggml_backend_awnpu_is_output_head_node(op) && ggml_backend_awnpu_lm_head_on_npu()) {
+        return true;
+    }
+
+    const int il = ggml_backend_awnpu_infer_layer_index(op);
+    if (il >= 0) {
+        return ggml_backend_awnpu_layer_on_npu(il);
+    }
+
+    return false;
 }
 
 // 判断这个 device 能否使用某种 buffer_type。 这个设备能不能处理放在这种内存里的 tensor
@@ -732,6 +768,84 @@ static bool ggml_backend_awnpu_device_supports_buft(ggml_backend_dev_t dev, ggml
     }
 
     return false;
+}
+
+static int64_t ggml_backend_awnpu_get_op_batch_size(const struct ggml_tensor * op) {
+    GGML_ASSERT(op != nullptr);
+
+    switch (op->op) {
+        case GGML_OP_MUL_MAT:
+            return op->ne[1];
+        case GGML_OP_MUL_MAT_ID:
+            return op->ne[2];
+        default:
+            return ggml_nrows(op);
+    }
+}
+
+static bool ggml_backend_awnpu_op_has_cpu_host_weights(const struct ggml_tensor * op) {
+    GGML_ASSERT(op != nullptr);
+
+    for (int i = 0; i < GGML_MAX_SRC; ++i) {
+        const struct ggml_tensor * src = op->src[i];
+        if (src == nullptr || src->buffer == nullptr) {
+            continue;
+        }
+
+        if (src->buffer->usage != GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
+            continue;
+        }
+
+        // AWNPU buft 也标记为 host（共享 DDR），不能据此视为 CPU 层权重。
+        if (ggml_backend_awnpu_weight_on_npu(src)) {
+            continue;
+        }
+
+        if (ggml_backend_buffer_is_host(src->buffer)) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static bool ggml_backend_awnpu_op_has_npu_weights(const struct ggml_tensor * op) {
+    GGML_ASSERT(op != nullptr);
+
+    for (int i = 0; i < GGML_MAX_SRC; ++i) {
+        if (ggml_backend_awnpu_weight_on_npu(op->src[i])) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static bool ggml_backend_awnpu_device_offload_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
+    auto * dev_ctx = (ggml_backend_awnpu_device_context *) dev->context;
+    if (dev_ctx == nullptr || op == nullptr) {
+        return false;
+    }
+
+    // offload_op is a preference hook for expensive host-weight ops, not a
+    // generic "can this backend compute the op" check.
+    switch (op->op) {
+        case GGML_OP_MUL_MAT:
+        case GGML_OP_MUL_MAT_ID:
+            break;
+        default:
+            return false;
+    }
+
+    if (!ggml_backend_awnpu_op_supported(op->op)) {
+        return false;
+    }
+
+    if (!ggml_backend_awnpu_op_has_cpu_host_weights(op)) {
+        return false;
+    }
+
+    return ggml_backend_awnpu_get_op_batch_size(op) >= dev_ctx->op_offload_min_batch_size;
 }
 
 // 根据这个 device 创建一个 ggml_backend_t，也就是一个可执行的 backend 实例。
@@ -757,7 +871,6 @@ static ggml_backend_t ggml_backend_awnpu_device_init_backend(ggml_backend_dev_t 
         GGML_LOG_INFO("%s: AWNPU_LLM_SIM enabled\n", __func__);
     }
 
-
     if (params != nullptr) {
         const std::string p = params;
         auto pos = p.find("threads=");
@@ -766,18 +879,6 @@ static ggml_backend_t ggml_backend_awnpu_device_init_backend(ggml_backend_dev_t 
         }
         if (p.find("ref=1") != std::string::npos) {
             backend_ctx->use_ref = true;
-        }
-    }
-
-    if (backend_ctx->sim_enabled) {
-        backend_ctx->sim_log_path = "awnpu_llm_sim.log";
-        backend_ctx->sim_log_file = std::fopen(backend_ctx->sim_log_path.c_str(), "a");
-        if (backend_ctx->sim_log_file == nullptr) {
-            GGML_LOG_WARN("%s: failed to open sim log file %s\n", __func__, backend_ctx->sim_log_path.c_str());
-        } else {
-            GGML_LOG_INFO("%s: writing sim log to %s\n", __func__, backend_ctx->sim_log_path.c_str());
-            std::fprintf(backend_ctx->sim_log_file, "=== awnpu llm sim start ===\n");
-            std::fflush(backend_ctx->sim_log_file);
         }
     }
 
@@ -825,11 +926,6 @@ ggml_backend_dev_init() 创建出来的 backend，最后都要通过这个函数
 static void ggml_backend_awnpu_backend_free(ggml_backend_t backend) {
     auto * ctx = (ggml_backend_awnpu_context *) backend->context;
     if (ctx != nullptr) {
-        if (ctx->sim_log_file != nullptr) {
-            std::fprintf(ctx->sim_log_file, "=== awnpu llm sim end ===\n");
-            std::fclose(ctx->sim_log_file);
-            ctx->sim_log_file = nullptr;
-        }
         ggml_aligned_free(ctx->work_data, ctx->work_size);
         delete ctx;
     }
@@ -851,45 +947,6 @@ static void ggml_backend_awnpu_set_abort_callback(ggml_backend_t backend, ggml_a
     }
 }
 
-static const char * ggml_backend_awnpu_status_name(enum ggml_status status) {
-    switch (status) {
-        case GGML_STATUS_SUCCESS:
-            return "success";
-        case GGML_STATUS_ALLOC_FAILED:
-            return "alloc_failed";
-        case GGML_STATUS_FAILED:
-            return "failed";
-        case GGML_STATUS_ABORTED:
-            return "aborted";
-        default:
-            return "unknown";
-    }
-}
-
-static void ggml_backend_awnpu_log_node(ggml_backend_t backend, const struct ggml_tensor * node, bool layout_only, enum ggml_status status) {
-    auto * ctx = (ggml_backend_awnpu_context *) backend->context;
-    if (ctx == nullptr || !ctx->sim_enabled || ctx->sim_log_file == nullptr || node == nullptr) {
-        return;
-    }
-
-    std::lock_guard<std::mutex> lock(ctx->sim_log_mutex);
-    const uint64_t seq = ++ctx->sim_node_counter;
-
-    std::fprintf(
-            ctx->sim_log_file,
-            "seq=%" PRIu64 " name=%s op=%s type=%s shape=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] layout_only=%d status=%s\n",
-            seq,
-            node->name[0] != '\0' ? node->name : "<unnamed>",
-            ggml_op_name(node->op),
-            ggml_type_name(node->type),
-            (int64_t) node->ne[0],
-            (int64_t) node->ne[1],
-            (int64_t) node->ne[2],
-            (int64_t) node->ne[3],
-            layout_only ? 1 : 0,
-            ggml_backend_awnpu_status_name(status));
-    std::fflush(ctx->sim_log_file);
-}
 
 static int ggml_backend_awnpu_sim_get_last_node_idx(const void * ctx_ptr) {
     const auto * ctx = (const ggml_backend_awnpu_context *) ctx_ptr;
@@ -945,65 +1002,6 @@ static ggml_backend_t ggml_backend_awnpu_init_cpu_backend(ggml_backend_t backend
     return cpu_backend;
 }
 
-static bool ggml_backend_awnpu_tensor_has_layer_suffix(const struct ggml_tensor * tensor) {
-    if (tensor == nullptr || tensor->name[0] == '\0') {
-        return false;
-    }
-
-    const char * name = tensor->name;
-    const char * dash = std::strrchr(name, '-');
-    if (dash == nullptr || *(dash + 1) == '\0') {
-        return false;
-    }
-
-    for (const char * p = dash + 1; *p != '\0'; ++p) {
-        if (!std::isdigit((unsigned char) *p)) {
-            return false;
-        }
-    }
-
-    return true;
-}
-
-static bool ggml_backend_awnpu_tensor_is_sampler_node(const struct ggml_tensor * tensor) {
-    if (tensor == nullptr || tensor->name[0] == '\0') {
-        return false;
-    }
-
-    static const char * prefixes[] = {
-        "greedy_",
-        "dist_",
-        "top_k",
-        "top_p_",
-        "min_p_",
-        "temp_ext_",
-        "temp_",
-        "logit_bias",
-        "logits_seq_",
-    };
-
-    return std::any_of(std::begin(prefixes), std::end(prefixes), [tensor](const char * prefix) {
-        return std::strncmp(tensor->name, prefix, std::strlen(prefix)) == 0;
-    });
-}
-
-// 纯元数据 layout 节点：不搬数据，sim 下可跳过。
-static bool ggml_backend_awnpu_node_is_layout_only(const struct ggml_tensor * node) {
-    if (node == nullptr) {
-        return false;
-    }
-
-    switch (node->op) {
-        case GGML_OP_NONE:
-        case GGML_OP_RESHAPE:
-        case GGML_OP_VIEW:
-        case GGML_OP_PERMUTE:
-        case GGML_OP_TRANSPOSE:
-            return true;
-        default:
-            return false;
-    }
-}
 
 static enum ggml_status ggml_backend_awnpu_prepare_cplan(
         ggml_backend_awnpu_context * ctx,
@@ -1091,7 +1089,7 @@ static enum ggml_status ggml_backend_awnpu_compute_node_npu(
                 node);
     }
 
-    return ggml_backend_awnpu_compute_node_real_op(ctx, node);
+    return ggml_backend_awnpu_compute_node_op(ctx, node);
 }
 
 static enum ggml_status ggml_backend_awnpu_graph_compute_npu(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
@@ -1103,6 +1101,8 @@ static enum ggml_status ggml_backend_awnpu_graph_compute_npu(ggml_backend_t back
 
     ctx->sim_last_node_idx = -1;
 
+    const bool log_nodes = ggml_backend_graph_node_done_callback_is_set();
+
     enum ggml_status status = GGML_STATUS_SUCCESS;
     for (int i = 0; i < cgraph->n_nodes; ++i) {
         struct ggml_tensor * node = cgraph->nodes[i];
@@ -1111,16 +1111,23 @@ static enum ggml_status ggml_backend_awnpu_graph_compute_npu(ggml_backend_t back
         }
 
         if (ggml_backend_awnpu_node_is_layout_only(node)) {
-            if (ctx->sim_enabled) {
-                ggml_backend_awnpu_log_node(backend, node, true, GGML_STATUS_SUCCESS);
+            if (log_nodes) {
+                ggml_backend_invoke_graph_node_done_callback(NULL, cgraph, i, 0);
             }
             continue;
         }
 
-        status = ggml_backend_awnpu_compute_node_npu(backend, cgraph, i, nullptr, node);
-        if (ctx->sim_enabled) {
-            ggml_backend_awnpu_log_node(backend, node, false, status);
+        int64_t t0 = 0;
+        if (log_nodes) {
+            t0 = ggml_time_us();
         }
+
+        status = ggml_backend_awnpu_compute_node_npu(backend, cgraph, i, nullptr, node);
+
+        if (log_nodes) {
+            ggml_backend_invoke_graph_node_done_callback(NULL, cgraph, i, ggml_time_us() - t0);
+        }
+
         if (status != GGML_STATUS_SUCCESS) {
             break;
         }
@@ -1162,36 +1169,7 @@ static enum ggml_status ggml_backend_awnpu_graph_compute(ggml_backend_t backend,
         return GGML_STATUS_SUCCESS;
     }
 
-    if (ctx->sim_enabled) {
-        return ggml_backend_awnpu_graph_compute_npu(backend, cgraph);
-    }
-
-    int prefix_end = 0;
-    int suffix_start = cgraph->n_nodes;
-
-    for (int i = 0; i < cgraph->n_nodes; ++i) {
-        struct ggml_tensor * node = cgraph->nodes[i];
-        if (node == nullptr) {
-            continue;
-        }
-
-        if (prefix_end == 0 && ggml_backend_awnpu_tensor_has_layer_suffix(node)) {
-            prefix_end = i;
-        }
-
-        if (suffix_start == cgraph->n_nodes && ggml_backend_awnpu_tensor_is_sampler_node(node)) {
-            suffix_start = i;
-        }
-
-        if (prefix_end > 0 && suffix_start < cgraph->n_nodes) {
-            break;
-        }
-    }
-
-    // 没有识别出可分层的边界时，退回到当前的统一执行路径。
-    if ((prefix_end == 0 && suffix_start == cgraph->n_nodes) || (suffix_start < cgraph->n_nodes && prefix_end >= suffix_start)) {
-        return ggml_backend_awnpu_graph_compute_cpu(backend, cgraph);
-    }
+    const ggml_backend_awnpu_graph_split split = ggml_backend_awnpu_detect_graph_split(cgraph);
 
     ggml_backend_t cpu_backend = ggml_backend_awnpu_init_cpu_backend(backend);
 
@@ -1201,24 +1179,24 @@ static enum ggml_status ggml_backend_awnpu_graph_compute(ggml_backend_t backend,
 
     enum ggml_status status = GGML_STATUS_SUCCESS;
 
-    if (prefix_end > 0) {
-        struct ggml_cgraph prefix_graph = ggml_graph_view(cgraph, 0, prefix_end);
+    if (split.prefix_end > 0) {
+        struct ggml_cgraph prefix_graph = ggml_graph_view(cgraph, 0, split.prefix_end);
         status = ggml_backend_graph_compute(cpu_backend, &prefix_graph);
         if (status != GGML_STATUS_SUCCESS) {
             goto done;
         }
     }
 
-    if (prefix_end < suffix_start) {
-        struct ggml_cgraph middle_graph = ggml_graph_view(cgraph, prefix_end, suffix_start);
+    if (split.prefix_end < split.suffix_start) {
+        struct ggml_cgraph middle_graph = ggml_graph_view(cgraph, split.prefix_end, split.suffix_start);
         status = ggml_backend_awnpu_graph_compute_npu(backend, &middle_graph);
         if (status != GGML_STATUS_SUCCESS) {
             goto done;
         }
     }
 
-    if (suffix_start < cgraph->n_nodes) {
-        struct ggml_cgraph suffix_graph = ggml_graph_view(cgraph, suffix_start, cgraph->n_nodes);
+    if (split.suffix_start < cgraph->n_nodes) {
+        struct ggml_cgraph suffix_graph = ggml_graph_view(cgraph, split.suffix_start, cgraph->n_nodes);
         status = ggml_backend_graph_compute(cpu_backend, &suffix_graph);
         if (status != GGML_STATUS_SUCCESS) {
             goto done;
@@ -1314,6 +1292,12 @@ static void * ggml_backend_awnpu_get_proc_address(ggml_backend_reg_t reg, const 
     if (std::strcmp(name, "ggml_backend_set_abort_callback") == 0) {
         return (void *) ggml_backend_awnpu_set_abort_callback;
     }
+    if (std::strcmp(name, "ggml_backend_set_model_n_layer") == 0) {
+        return (void *) ggml_backend_awnpu_set_model_n_layer;
+    }
+    if (std::strcmp(name, "llama_graph_exec_log_get_callbacks") == 0) {
+        return (void *) ggml_backend_awnpu_graph_exec_log_get_callbacks;
+    }
     return nullptr;
 }
 
@@ -1326,11 +1310,29 @@ static const struct ggml_backend_reg_i ggml_backend_awnpu_reg_i = {
 
 static ggml_backend_awnpu_reg_context * ggml_backend_awnpu_reg_init(void) {
     auto * ctx = new ggml_backend_awnpu_reg_context;
+    const int min_batch_size = std::max(1, ggml_backend_awnpu_parse_int_env("GGML_OP_OFFLOAD_MIN_BATCH", 1));
 
     ggml_backend_awnpu_probe_info probe{};
     if (!ggml_backend_awnpu_probe(&probe)) {
         delete ctx;
         return nullptr;
+    }
+
+    GGML_LOG_INFO("ggml_backend_awnpu_reg_init: probe.n_devices = %d\n", probe.n_devices);
+    for (int i = 0; i < probe.n_devices; ++i) {
+        const ggml_backend_awnpu_device_probe_info & probe_dev = probe.devices[(size_t) i];
+        GGML_LOG_INFO("Device %d: \n\
+            memory_total = %zu MB, \n\
+            memory_free = %zu MB, \n\
+            buffer_alignment = %zu, \n\
+            buffer_max_size = %zu, \n\
+            shared_host_buffer = %d\n\n", 
+            i, 
+            probe_dev.memory_total / 1024 / 1024, 
+            probe_dev.memory_free / 1024 / 1024, 
+            probe_dev.buffer_alignment, 
+            probe_dev.buffer_max_size, 
+            probe_dev.shared_host_buffer);
     }
 
     for (int i = 0; i < probe.n_devices; ++i) {
@@ -1341,7 +1343,7 @@ static ggml_backend_awnpu_reg_context * ggml_backend_awnpu_reg_init(void) {
         buft_ctx->name = std::string(GGML_AWNPU_NAME) + std::to_string(i);
         buft_ctx->alignment = probe_dev.buffer_alignment;
         buft_ctx->max_size = probe_dev.buffer_max_size;
-        buft_ctx->is_host = probe_dev.shared_host_buffer;
+        buft_ctx->is_host = true; //probe_dev.shared_host_buffer;
 
         auto buft = std::make_unique<ggml_backend_buffer_type>();
         *buft = {
@@ -1364,6 +1366,7 @@ static ggml_backend_awnpu_reg_context * ggml_backend_awnpu_reg_init(void) {
         dev_ctx->device_id = "awnpu:" + std::to_string(i);
         dev_ctx->memory_total = probe_dev.memory_total;
         dev_ctx->memory_free = probe_dev.memory_free;
+        dev_ctx->op_offload_min_batch_size = min_batch_size;
 
         // 这个 npu 的内存分配器规格/内存池类型描述
         // 描述怎么分配，包括名字、对齐、实际分配大小、是否 host memory、如何创建 buffer。
@@ -1383,7 +1386,7 @@ static ggml_backend_awnpu_reg_context * ggml_backend_awnpu_reg_init(void) {
                 /* .buffer_from_host_ptr = */ ggml_backend_awnpu_device_buffer_from_host_ptr,
                 /* .supports_op          = */ ggml_backend_awnpu_device_supports_op,
                 /* .supports_buft        = */ ggml_backend_awnpu_device_supports_buft,
-                /* .offload_op           = */ nullptr,
+                /* .offload_op           = */ nullptr, //ggml_backend_awnpu_device_offload_op,
                 /* .event_new            = */ nullptr,
                 /* .event_free           = */ nullptr,
                 /* .event_synchronize    = */ nullptr,
@@ -1411,6 +1414,7 @@ ggml_backend_reg_t ggml_backend_awnpu_reg(void) {
     static std::unique_ptr<ggml_backend_awnpu_reg_context> reg_ctx;
 
     std::lock_guard<std::mutex> lock(mutex);
+
     if (!initialized) {
         reg_ctx.reset(ggml_backend_awnpu_reg_init());
         if (reg_ctx == nullptr || reg_ctx->devices.empty()) {

@@ -813,6 +813,9 @@ void llm_graph_result::reset() {
 
     inputs.clear();
 
+    // 预留 最多 max_nodes 个张量对象 的元数据空间 
+    // + 
+    // 预留 计算图对象 ggml_cgraph 本身 以及它维护节点索引、hash、叶子节点等辅助数组的空间。
     buf_compute_meta.resize(ggml_tensor_overhead()*max_nodes + ggml_graph_overhead_custom(max_nodes, false));
 
     ggml_init_params params = {

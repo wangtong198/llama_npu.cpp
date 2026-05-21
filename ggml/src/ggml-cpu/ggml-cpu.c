@@ -2983,19 +2983,35 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
     GGML_PRINT_DEBUG("thread #%d compute-start cplan %p last-graph %d\n", state->ith, (const void *)cplan, state->last_graph);
 #endif
 
+    const bool log_nodes = state->ith == 0 && ggml_backend_graph_node_done_callback_is_set();
+
     for (int node_n = 0; node_n < cgraph->n_nodes && atomic_load_explicit(&tp->abort, memory_order_relaxed) != node_n; node_n++) {
         struct ggml_tensor * node = cgraph->nodes[node_n];
 
         if (ggml_op_is_empty(node->op)) {
-            // skip NOPs
+            if (log_nodes) {
+                ggml_backend_invoke_graph_node_done_callback(NULL, cgraph, node_n, 0);
+            }
             continue;
         }
 
         if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+            if (log_nodes) {
+                ggml_backend_invoke_graph_node_done_callback(NULL, cgraph, node_n, 0);
+            }
             continue;
         }
 
+        int64_t t0 = 0;
+        if (log_nodes) {
+            t0 = ggml_time_us();
+        }
+
         ggml_compute_forward(&params, node);
+
+        if (log_nodes) {
+            ggml_backend_invoke_graph_node_done_callback(NULL, cgraph, node_n, ggml_time_us() - t0);
+        }
 
         if (state->ith == 0 && cplan->abort_callback &&
                 cplan->abort_callback(cplan->abort_callback_data)) {

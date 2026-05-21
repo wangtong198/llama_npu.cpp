@@ -246,7 +246,7 @@ option(GGML_METAL                           "ggml: use Metal"                   
 option(GGML_METAL_NDEBUG                    "ggml: disable Metal debugging"                   OFF)
 option(GGML_METAL_SHADER_DEBUG              "ggml: compile Metal with -fno-fast-math"         OFF)
 option(GGML_METAL_EMBED_LIBRARY             "ggml: embed Metal library"                       ${GGML_METAL})
-option(GGML_AWNPU                           "ggml: use AWNPU"                                 OFF)
+option(GGML_AWNPU                           "ggml: use AWNPU"                                 ON)
 set   (GGML_METAL_MACOSX_VERSION_MIN "" CACHE STRING
                                             "ggml: metal minimum macOS version")
 set   (GGML_METAL_STD "" CACHE STRING       "ggml: metal standard version (-std flag)")

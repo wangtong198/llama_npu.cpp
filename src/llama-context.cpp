@@ -1,5 +1,7 @@
 #include "llama-context.h"
 
+#include "llama-graph-exec-log.h"
+
 #include "ggml.h"
 #include "llama-arch.h"
 #include "llama-impl.h"
@@ -16,6 +18,7 @@
 #include <cstring>
 #include <limits>
 #include <stdexcept>
+#include <vector>
 
 //
 // llama_context
@@ -258,6 +261,15 @@ llama_context::llama_context(
                 if (ggml_backend_set_n_threads_fn) {
                     set_n_threads_fns.emplace_back(backend.get(), ggml_backend_set_n_threads_fn);
                 }
+
+                // optional per-backend model params; unsupported backends return nullptr
+                if (hparams.n_layer > 0) {
+                    auto set_model_n_layer_fn = (ggml_backend_set_model_n_layer_t)
+                        ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_model_n_layer");
+                    if (set_model_n_layer_fn) {
+                        set_model_n_layer_fn(hparams.n_layer);
+                    }
+                }
             }
         }
 
@@ -353,6 +365,29 @@ llama_context::llama_context(
         }
 
         sched_reserve();
+
+        {
+            std::vector<ggml_backend_reg_t> log_regs;
+            log_regs.reserve(backends.size());
+            for (auto & backend : backends) {
+                ggml_backend_dev_t dev = ggml_backend_get_device(backend.get());
+                ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+                if (reg == nullptr) {
+                    continue;
+                }
+                bool seen = false;
+                for (ggml_backend_reg_t existing : log_regs) {
+                    if (existing == reg) {
+                        seen = true;
+                        break;
+                    }
+                }
+                if (!seen) {
+                    log_regs.push_back(reg);
+                }
+            }
+            llama_graph_exec_log_prepare(log_regs.data(), log_regs.size());
+        }
 
         if (!cparams.flash_attn) {
             if (ggml_is_quantized(params.type_v)) {

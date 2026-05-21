@@ -20,6 +20,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <algorithm>
+#include <mutex>
 #include <vector>
 
 #ifdef __APPLE__
@@ -451,6 +452,78 @@ enum ggml_status ggml_backend_graph_compute(ggml_backend_t backend, struct ggml_
 enum ggml_status ggml_backend_graph_compute_async(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
     GGML_ASSERT(backend);
     return backend->iface.graph_compute(backend, cgraph);
+}
+
+static std::mutex                   g_ggml_graph_exec_info_mutex;
+static ggml_backend_graph_exec_info g_ggml_graph_exec_info {};
+
+static void ggml_graph_exec_info_set_split(int split_index, int n_splits) {
+    std::lock_guard<std::mutex> lock(g_ggml_graph_exec_info_mutex);
+    g_ggml_graph_exec_info.split_index = split_index;
+    g_ggml_graph_exec_info.n_splits    = n_splits;
+}
+
+static void ggml_graph_exec_info_clear_split(void) {
+    std::lock_guard<std::mutex> lock(g_ggml_graph_exec_info_mutex);
+    g_ggml_graph_exec_info.split_index = 0;
+    g_ggml_graph_exec_info.n_splits    = 0;
+}
+
+void ggml_backend_get_graph_exec_info(ggml_backend_graph_exec_info * info) {
+    GGML_ASSERT(info != NULL);
+    std::lock_guard<std::mutex> lock(g_ggml_graph_exec_info_mutex);
+    *info = g_ggml_graph_exec_info;
+}
+
+static std::mutex                   g_ggml_graph_split_begin_cb_mutex;
+static ggml_backend_graph_split_begin_cb g_ggml_graph_split_begin_cb = nullptr;
+static void *                       g_ggml_graph_split_begin_cb_user_data = nullptr;
+
+void ggml_backend_set_graph_split_begin_callback(ggml_backend_graph_split_begin_cb cb, void * user_data) {
+    std::lock_guard<std::mutex> lock(g_ggml_graph_split_begin_cb_mutex);
+    g_ggml_graph_split_begin_cb           = cb;
+    g_ggml_graph_split_begin_cb_user_data = user_data;
+}
+
+static void ggml_backend_invoke_graph_split_begin_callback(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
+    ggml_backend_graph_split_begin_cb cb = nullptr;
+    void * user_data = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(g_ggml_graph_split_begin_cb_mutex);
+        cb        = g_ggml_graph_split_begin_cb;
+        user_data = g_ggml_graph_split_begin_cb_user_data;
+    }
+    if (cb != nullptr) {
+        cb(backend, cgraph, user_data);
+    }
+}
+
+static std::mutex                   g_ggml_graph_node_done_cb_mutex;
+static ggml_backend_graph_node_done_cb g_ggml_graph_node_done_cb = nullptr;
+static void *                       g_ggml_graph_node_done_cb_user_data = nullptr;
+
+void ggml_backend_set_graph_node_done_callback(ggml_backend_graph_node_done_cb cb, void * user_data) {
+    std::lock_guard<std::mutex> lock(g_ggml_graph_node_done_cb_mutex);
+    g_ggml_graph_node_done_cb           = cb;
+    g_ggml_graph_node_done_cb_user_data = user_data;
+}
+
+bool ggml_backend_graph_node_done_callback_is_set(void) {
+    std::lock_guard<std::mutex> lock(g_ggml_graph_node_done_cb_mutex);
+    return g_ggml_graph_node_done_cb != nullptr;
+}
+
+void ggml_backend_invoke_graph_node_done_callback(ggml_backend_t backend, const struct ggml_cgraph * cgraph, int node_idx, int64_t elapsed_us) {
+    ggml_backend_graph_node_done_cb cb = nullptr;
+    void * user_data = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(g_ggml_graph_node_done_cb_mutex);
+        cb        = g_ggml_graph_node_done_cb;
+        user_data = g_ggml_graph_node_done_cb_user_data;
+    }
+    if (cb != nullptr) {
+        cb(backend, cgraph, node_idx, elapsed_us, user_data);
+    }
 }
 
 bool ggml_backend_supports_op(ggml_backend_t backend, const struct ggml_tensor * op) {
@@ -1693,6 +1766,13 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
 
+    {
+        std::lock_guard<std::mutex> lock(g_ggml_graph_exec_info_mutex);
+        g_ggml_graph_exec_info.sched_round++;
+        g_ggml_graph_exec_info.split_index = 0;
+        g_ggml_graph_exec_info.n_splits    = sched->n_splits;
+    }
+
     ggml_tensor * prev_ids_tensor = nullptr;
     std::vector<int32_t> ids;
     std::vector<ggml_bitset_t> used_ids;
@@ -1826,7 +1906,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         }
 
         if (!sched->callback_eval) {
+            ggml_graph_exec_info_set_split(split_id + 1, sched->n_splits);
+            ggml_backend_invoke_graph_split_begin_callback(split_backend, &split->graph);
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
+            ggml_graph_exec_info_clear_split();
             if (ec != GGML_STATUS_SUCCESS) {
                 return ec;
             }
@@ -1848,7 +1931,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
                 struct ggml_cgraph gv = ggml_graph_view(&split->graph, j0, j1 + 1);
 
+                ggml_graph_exec_info_set_split(split_id + 1, sched->n_splits);
+                ggml_backend_invoke_graph_split_begin_callback(split_backend, &gv);
                 enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &gv);
+                ggml_graph_exec_info_clear_split();
                 if (ec != GGML_STATUS_SUCCESS) {
                     return ec;
                 }

@@ -30,7 +30,7 @@ static enum ggml_status ggml_backend_awnpu_sim_forward_to_node(
     return status;
 }
 
-bool ggml_backend_awnpu_op_supported(enum ggml_op op) {
+static bool ggml_backend_awnpu_op_is_supported(enum ggml_op op) {
     switch (op) {
         case GGML_OP_GET_ROWS:
         case GGML_OP_MUL_MAT:
@@ -44,6 +44,7 @@ bool ggml_backend_awnpu_op_supported(enum ggml_op op) {
         case GGML_OP_SQR:
         case GGML_OP_SQRT:
         case GGML_OP_LOG:
+        case GGML_OP_UNARY: // ggml_silu / ggml_gelu / ...
         case GGML_OP_NORM:
         case GGML_OP_RMS_NORM:
         case GGML_OP_SOFT_MAX:
@@ -64,6 +65,10 @@ bool ggml_backend_awnpu_op_supported(enum ggml_op op) {
     }
 }
 
+bool ggml_backend_awnpu_op_supported(enum ggml_op op) {
+    return ggml_backend_awnpu_op_is_supported(op);
+}
+
 enum ggml_status ggml_backend_awnpu_compute_node_sim_op(
         void * ctx,
         const struct ggml_backend_awnpu_op_dispatch * dispatch,
@@ -72,74 +77,22 @@ enum ggml_status ggml_backend_awnpu_compute_node_sim_op(
         struct ggml_tensor * node) {
     GGML_ASSERT(node != nullptr);
 
-    switch (node->op) {
-        case GGML_OP_GET_ROWS:
-        case GGML_OP_MUL_MAT:
-        case GGML_OP_MUL_MAT_ID:
-        case GGML_OP_ADD:
-        case GGML_OP_ADD_ID:
-        case GGML_OP_ADD1:
-        case GGML_OP_MUL:
-        case GGML_OP_DIV:
-        case GGML_OP_SUB:
-        case GGML_OP_SQR:
-        case GGML_OP_SQRT:
-        case GGML_OP_LOG:
-        case GGML_OP_NORM:
-        case GGML_OP_RMS_NORM:
-        case GGML_OP_SOFT_MAX:
-        case GGML_OP_ROPE:
-        case GGML_OP_ROPE_BACK:
-        case GGML_OP_SCALE:
-        case GGML_OP_CLAMP:
-        case GGML_OP_SET_ROWS:
-        case GGML_OP_GLU:
-        case GGML_OP_FLASH_ATTN_EXT:
-        case GGML_OP_CPY:
-        case GGML_OP_CONT:
-        case GGML_OP_DUP:
-        case GGML_OP_PAD:
-            return ggml_backend_awnpu_sim_forward_to_node(ctx, dispatch, cgraph, node_idx);
-        default:
-            return GGML_STATUS_FAILED;
+    if (ggml_backend_awnpu_op_is_supported(node->op)) {
+        return ggml_backend_awnpu_sim_forward_to_node(ctx, dispatch, cgraph, node_idx);
     }
+
+    return GGML_STATUS_FAILED;
 }
 
-enum ggml_status ggml_backend_awnpu_compute_node_real_op(
+enum ggml_status ggml_backend_awnpu_compute_node_op(
         void * ctx,
         struct ggml_tensor * node) {
     GGML_ASSERT(node != nullptr);
     GGML_UNUSED(ctx);
 
-    switch (node->op) {
-        case GGML_OP_GET_ROWS:
-        case GGML_OP_MUL_MAT:
-        case GGML_OP_MUL_MAT_ID:
-        case GGML_OP_ADD:
-        case GGML_OP_ADD_ID:
-        case GGML_OP_ADD1:
-        case GGML_OP_MUL:
-        case GGML_OP_DIV:
-        case GGML_OP_SUB:
-        case GGML_OP_SQR:
-        case GGML_OP_SQRT:
-        case GGML_OP_LOG:
-        case GGML_OP_NORM:
-        case GGML_OP_RMS_NORM:
-        case GGML_OP_SOFT_MAX:
-        case GGML_OP_ROPE:
-        case GGML_OP_ROPE_BACK:
-        case GGML_OP_SCALE:
-        case GGML_OP_CLAMP:
-        case GGML_OP_SET_ROWS:
-        case GGML_OP_GLU:
-        case GGML_OP_FLASH_ATTN_EXT:
-        case GGML_OP_CPY:
-        case GGML_OP_CONT:
-        case GGML_OP_DUP:
-        case GGML_OP_PAD:
-            return GGML_STATUS_SUCCESS;
-        default:
-            return GGML_STATUS_FAILED;
+    if (ggml_backend_awnpu_op_is_supported(node->op)) {
+        return GGML_STATUS_SUCCESS;
     }
+
+    return GGML_STATUS_FAILED;
 }

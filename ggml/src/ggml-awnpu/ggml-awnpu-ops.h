@@ -18,6 +18,6 @@ enum ggml_status ggml_backend_awnpu_compute_node_sim_op(
         int node_idx,
         struct ggml_tensor * node);
 
-enum ggml_status ggml_backend_awnpu_compute_node_real_op(
+enum ggml_status ggml_backend_awnpu_compute_node_op(
         void * ctx,
         struct ggml_tensor * node);

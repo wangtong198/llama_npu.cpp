@@ -7,3 +7,5 @@ ggml_add_backend_library(ggml-awnpu
     ${GGML_HEADERS_AWNPU}
     ${GGML_SOURCES_AWNPU}
 )
+
+target_include_directories(ggml-awnpu PRIVATE ${CMAKE_SOURCE_DIR}/include)

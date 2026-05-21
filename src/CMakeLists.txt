@@ -4,6 +4,15 @@ llama_add_compile_flags()
 # libraries
 #
 
+# llama graph exec log (optional debug trace; enabled via LLAMA_GRAPH_EXEC_LOG=1)
+
+add_library(llama-graph-exec-log
+            llama-graph-exec-log.cpp)
+
+target_include_directories(llama-graph-exec-log PUBLIC  ../include)
+target_include_directories(llama-graph-exec-log PRIVATE ../ggml/src)
+target_link_libraries(llama-graph-exec-log PUBLIC ggml)
+
 # llama
 
 add_library(llama
@@ -162,6 +171,7 @@ target_include_directories(llama PUBLIC ../include)
 target_compile_features   (llama PRIVATE cxx_std_17) # don't bump
 
 target_link_libraries(llama PUBLIC ggml)
+target_link_libraries(llama PRIVATE llama-graph-exec-log)
 
 if (BUILD_SHARED_LIBS)
     set_target_properties(llama PROPERTIES POSITION_INDEPENDENT_CODE ON)

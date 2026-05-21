@@ -104,6 +104,25 @@ extern "C" {
     GGML_API enum ggml_status ggml_backend_graph_compute      (ggml_backend_t backend, struct ggml_cgraph * cgraph);
     GGML_API enum ggml_status ggml_backend_graph_compute_async(ggml_backend_t backend, struct ggml_cgraph * cgraph);
 
+    // scheduler graph execution context; valid during graph_compute calls from ggml_backend_sched
+    typedef struct ggml_backend_graph_exec_info {
+        uint64_t sched_round; // 1-based count of scheduler graph_compute invocations
+        int      split_index; // 1-based split index within the current round; 0 if unset
+        int      n_splits;    // total splits in the current round; 0 if unset
+    } ggml_backend_graph_exec_info;
+
+    GGML_API void ggml_backend_get_graph_exec_info(ggml_backend_graph_exec_info * info);
+
+    // optional callback invoked by the scheduler before each split graph_compute
+    typedef void (*ggml_backend_graph_split_begin_cb)(ggml_backend_t backend, struct ggml_cgraph * cgraph, void * user_data);
+    GGML_API void ggml_backend_set_graph_split_begin_callback(ggml_backend_graph_split_begin_cb cb, void * user_data);
+
+    // optional callback invoked after each graph node completes during graph_compute
+    typedef void (*ggml_backend_graph_node_done_cb)(ggml_backend_t backend, const struct ggml_cgraph * cgraph, int node_idx, int64_t elapsed_us, void * user_data);
+    GGML_API void ggml_backend_set_graph_node_done_callback(ggml_backend_graph_node_done_cb cb, void * user_data);
+    GGML_API bool ggml_backend_graph_node_done_callback_is_set(void);
+    GGML_API void ggml_backend_invoke_graph_node_done_callback(ggml_backend_t backend, const struct ggml_cgraph * cgraph, int node_idx, int64_t elapsed_us);
+
     // NOTE: will be removed, use device version instead
     GGML_API bool ggml_backend_supports_op(ggml_backend_t backend, const struct ggml_tensor * op);
     GGML_API bool ggml_backend_supports_buft(ggml_backend_t backend, ggml_backend_buffer_type_t buft);
@@ -210,6 +229,8 @@ extern "C" {
     typedef ggml_backend_buffer_type_t   (*ggml_backend_split_buffer_type_t)(int main_device, const float * tensor_split);
     // Set the number of threads for the backend
     typedef void                         (*ggml_backend_set_n_threads_t)(ggml_backend_t backend, int n_threads);
+    // Optional: transformer block count from loaded model (hparams.n_layer)
+    typedef void                         (*ggml_backend_set_model_n_layer_t)(int n_layer);
     // Get additional buffer types provided by the device (returns a NULL-terminated array)
     typedef ggml_backend_buffer_type_t * (*ggml_backend_dev_get_extra_bufts_t)(ggml_backend_dev_t device);
     // Set the abort callback for the backend
