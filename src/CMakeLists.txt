@@ -11,7 +11,13 @@ add_library(llama-graph-exec-log
 
 target_include_directories(llama-graph-exec-log PUBLIC  ../include)
 target_include_directories(llama-graph-exec-log PRIVATE ../ggml/src)
-target_link_libraries(llama-graph-exec-log PUBLIC ggml)
+# Link ggml-base only (not ggml): full ggml pulls in ggml-awnpu and would cycle with the link below.
+target_link_libraries(llama-graph-exec-log PUBLIC ggml-base)
+
+# ggml-awnpu calls llama_graph_exec_log_*; record NEEDED on libggml-awnpu.so.
+if (TARGET ggml-awnpu)
+    target_link_libraries(ggml-awnpu PRIVATE llama-graph-exec-log)
+endif()
 
 # llama
 
