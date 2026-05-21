@@ -48,7 +48,6 @@ struct ggml_backend_awnpu_device_context {
     std::string device_id;
     size_t memory_total = 0;
     size_t memory_free = 0;
-    int op_offload_min_batch_size = 1;
     ggml_backend_buffer_type_t buft = nullptr;
 };
 
@@ -169,7 +168,6 @@ static enum ggml_status ggml_backend_awnpu_cpu_forward_range(
         int i0,
         int i1);
 static bool ggml_backend_awnpu_op_has_npu_weights(const struct ggml_tensor * op);
-static bool ggml_backend_awnpu_op_has_cpu_host_weights(const struct ggml_tensor * op);
 
 static void ggml_backend_awnpu_get_host_memory(size_t * memory_free, size_t * memory_total) {
     size_t total = 8ull * 1024 * 1024 * 1024;
@@ -333,8 +331,6 @@ static ggml_backend_awnpu_buffer_context * ggml_backend_awnpu_buffer_context_ini
 
 static void ggml_backend_awnpu_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     auto * ctx = (ggml_backend_awnpu_buffer_context *) buffer->context;
-    // The backing storage is host-managed. AWNPU must not release the
-    // CPU-allocated memory here; it only drops the wrapper context.
     if (ctx->owned) {
         ggml_backend_awnpu_host_aligned_free(ctx->data);
     }
@@ -560,7 +556,7 @@ static ggml_backend_buffer_t ggml_backend_awnpu_buffer_alloc_buffer(ggml_backend
 
     // 这里由 CPU/host 为 AWNPU 申请一块共享 DDR 空间，并按 NPU 要求的对齐方式分配。
     auto * buffer_ctx = ggml_backend_awnpu_buffer_context_init(
-            ggml_backend_awnpu_host_aligned_malloc(size, alignment), size, false);
+            ggml_backend_awnpu_host_aligned_malloc(size, alignment), size, true);
     if (buffer_ctx->data == nullptr) {
         delete buffer_ctx;
         return nullptr;
@@ -762,48 +758,9 @@ static bool ggml_backend_awnpu_device_supports_buft(ggml_backend_dev_t dev, ggml
         return true;
     }
 
-    // sim：允许 host buft（KV / 临时张量），权重仍用 AWNPU buft
-    if (ggml_backend_awnpu_sim_enabled() && ggml_backend_buft_is_host(buft)) {
+    // 共享 DDR 场景下，AWNPU 需要接受主机侧 buffer。
+    if (ggml_backend_buft_is_host(buft)) {
         return true;
-    }
-
-    return false;
-}
-
-static int64_t ggml_backend_awnpu_get_op_batch_size(const struct ggml_tensor * op) {
-    GGML_ASSERT(op != nullptr);
-
-    switch (op->op) {
-        case GGML_OP_MUL_MAT:
-            return op->ne[1];
-        case GGML_OP_MUL_MAT_ID:
-            return op->ne[2];
-        default:
-            return ggml_nrows(op);
-    }
-}
-
-static bool ggml_backend_awnpu_op_has_cpu_host_weights(const struct ggml_tensor * op) {
-    GGML_ASSERT(op != nullptr);
-
-    for (int i = 0; i < GGML_MAX_SRC; ++i) {
-        const struct ggml_tensor * src = op->src[i];
-        if (src == nullptr || src->buffer == nullptr) {
-            continue;
-        }
-
-        if (src->buffer->usage != GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
-            continue;
-        }
-
-        // AWNPU buft 也标记为 host（共享 DDR），不能据此视为 CPU 层权重。
-        if (ggml_backend_awnpu_weight_on_npu(src)) {
-            continue;
-        }
-
-        if (ggml_backend_buffer_is_host(src->buffer)) {
-            return true;
-        }
     }
 
     return false;
@@ -819,33 +776,6 @@ static bool ggml_backend_awnpu_op_has_npu_weights(const struct ggml_tensor * op)
     }
 
     return false;
-}
-
-static bool ggml_backend_awnpu_device_offload_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
-    auto * dev_ctx = (ggml_backend_awnpu_device_context *) dev->context;
-    if (dev_ctx == nullptr || op == nullptr) {
-        return false;
-    }
-
-    // offload_op is a preference hook for expensive host-weight ops, not a
-    // generic "can this backend compute the op" check.
-    switch (op->op) {
-        case GGML_OP_MUL_MAT:
-        case GGML_OP_MUL_MAT_ID:
-            break;
-        default:
-            return false;
-    }
-
-    if (!ggml_backend_awnpu_op_supported(op->op)) {
-        return false;
-    }
-
-    if (!ggml_backend_awnpu_op_has_cpu_host_weights(op)) {
-        return false;
-    }
-
-    return ggml_backend_awnpu_get_op_batch_size(op) >= dev_ctx->op_offload_min_batch_size;
 }
 
 // 根据这个 device 创建一个 ggml_backend_t，也就是一个可执行的 backend 实例。
@@ -1310,8 +1240,6 @@ static const struct ggml_backend_reg_i ggml_backend_awnpu_reg_i = {
 
 static ggml_backend_awnpu_reg_context * ggml_backend_awnpu_reg_init(void) {
     auto * ctx = new ggml_backend_awnpu_reg_context;
-    const int min_batch_size = std::max(1, ggml_backend_awnpu_parse_int_env("GGML_OP_OFFLOAD_MIN_BATCH", 1));
-
     ggml_backend_awnpu_probe_info probe{};
     if (!ggml_backend_awnpu_probe(&probe)) {
         delete ctx;
@@ -1366,7 +1294,6 @@ static ggml_backend_awnpu_reg_context * ggml_backend_awnpu_reg_init(void) {
         dev_ctx->device_id = "awnpu:" + std::to_string(i);
         dev_ctx->memory_total = probe_dev.memory_total;
         dev_ctx->memory_free = probe_dev.memory_free;
-        dev_ctx->op_offload_min_batch_size = min_batch_size;
 
         // 这个 npu 的内存分配器规格/内存池类型描述
         // 描述怎么分配，包括名字、对齐、实际分配大小、是否 host memory、如何创建 buffer。
@@ -1386,7 +1313,7 @@ static ggml_backend_awnpu_reg_context * ggml_backend_awnpu_reg_init(void) {
                 /* .buffer_from_host_ptr = */ ggml_backend_awnpu_device_buffer_from_host_ptr,
                 /* .supports_op          = */ ggml_backend_awnpu_device_supports_op,
                 /* .supports_buft        = */ ggml_backend_awnpu_device_supports_buft,
-                /* .offload_op           = */ nullptr, //ggml_backend_awnpu_device_offload_op,
+                /* .offload_op           = */ nullptr,
                 /* .event_new            = */ nullptr,
                 /* .event_free           = */ nullptr,
                 /* .event_synchronize    = */ nullptr,

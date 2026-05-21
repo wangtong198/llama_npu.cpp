@@ -90,9 +90,11 @@ enum ggml_status ggml_backend_awnpu_compute_node_op(
     GGML_ASSERT(node != nullptr);
     GGML_UNUSED(ctx);
 
-    if (ggml_backend_awnpu_op_is_supported(node->op)) {
-        return GGML_STATUS_SUCCESS;
+    if (!ggml_backend_awnpu_op_is_supported(node->op)) {
+        return GGML_STATUS_FAILED;
     }
 
+    GGML_LOG_ERROR("%s: non-sim AWNPU execution is not implemented for op %s (%s)\n",
+            __func__, ggml_op_name(node->op), node->name);
     return GGML_STATUS_FAILED;
 }

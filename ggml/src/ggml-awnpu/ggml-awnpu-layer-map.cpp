@@ -11,6 +11,7 @@
 static std::unordered_map<int, bool> g_layer_on_npu;
 static bool                          g_output_on_npu = false;
 static int                           g_model_n_layer = 0;
+static bool                          g_reset_pending = false;
 
 static int ggml_backend_awnpu_max_recorded_layer_index(void) {
     int max_il = -1;
@@ -107,12 +108,20 @@ void ggml_backend_awnpu_set_model_n_layer(int n_layer) {
     // Weights may already be loaded; do not clear layer placement recorded in buffer init.
     if (n_layer > 0) {
         g_model_n_layer = n_layer;
+        g_reset_pending = true;
     }
 }
 
 void ggml_backend_awnpu_record_layer_placement(const struct ggml_tensor * tensor, bool on_npu) {
     if (tensor == nullptr) {
         return;
+    }
+
+    if (g_reset_pending) {
+        g_layer_on_npu.clear();
+        g_output_on_npu = false;
+        g_model_n_layer = 0;
+        g_reset_pending = false;
     }
 
     if (ggml_backend_awnpu_is_output_weight_name(tensor->name)) {

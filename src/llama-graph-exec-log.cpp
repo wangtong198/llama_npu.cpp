@@ -16,7 +16,6 @@ struct llama_graph_exec_log_session {
     std::FILE *                     file           = nullptr;
     bool                            enabled        = false;
     bool                            want_log       = false;
-    bool                            prepare_done   = false;
     uint64_t                        node_counter   = 0;
     llama_graph_exec_log_callbacks  callbacks      {};
     bool                            callbacks_set  = false;
@@ -185,7 +184,6 @@ static void exec_log_node_done(
         int node_idx,
         int64_t elapsed_us,
         void * user_data) {
-    GGML_UNUSED(backend);
     GGML_UNUSED(user_data);
 
     if (!g_session.enabled || g_session.file == nullptr || cgraph == nullptr) {
@@ -204,6 +202,7 @@ static void exec_log_node_done(
     const double elapsed_ms = elapsed_us / 1000.0;
 
     std::lock_guard<std::mutex> lock(g_session.mutex);
+    GGML_UNUSED(backend);
     write_node_log(node, elapsed_ms);
 }
 
@@ -242,5 +241,4 @@ void llama_graph_exec_log_prepare(ggml_backend_reg_t * regs, size_t n_regs) {
         ggml_backend_set_graph_node_done_callback(exec_log_node_done, nullptr);
     });
 
-    g_session.prepare_done = true;
 }
