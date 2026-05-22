@@ -124,7 +124,7 @@ static bool ensure_enabled(void) {
         }
 
         g_session.enabled = true;
-        GGML_LOG_INFO("%s: LLAMA_GRAPH_EXEC_LOG enabled, writing to llama_graph_exec.log\n", __func__);
+        GGML_LOG_INFO("LLAMA_GRAPH_EXEC_LOG enabled, writing to llama_graph_exec.log\n");
         std::fprintf(g_session.file, "=== llama graph exec log start ===\n");
         std::fprintf(g_session.file, "=== header: sched split dispatch n_nodes | node: exec= ===\n");
         std::fflush(g_session.file);

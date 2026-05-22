@@ -984,6 +984,7 @@ static enum ggml_status ggml_backend_awnpu_compute_node(
     }
 
     if (!ggml_backend_awnpu_op_supported(node->op)) {
+        GGML_LOG_WARN("%s: op %d not supported, falling back to CPU\n", __func__, node->op);
         return ggml_backend_awnpu_fallback_cpu_node(
                 ctx, cgraph, node_idx, node, false);
     }
@@ -993,6 +994,7 @@ static enum ggml_status ggml_backend_awnpu_compute_node(
         return status;
     }
 
+    GGML_LOG_WARN("%s: op %d not supported, falling back to CPU, status: %d\n", __func__, node->op, status);
     return ggml_backend_awnpu_fallback_cpu_node(
             ctx, cgraph, node_idx, node, true);
 }
