@@ -1,7 +1,6 @@
 #include "ggml-awnpu.h"
 
 #include "ggml-awnpu-layer-map.h"
-#include "ggml-awnpu-exec-log-resolver.h"
 #include "ggml-awnpu-ops.h"
 #include "llama-graph-exec-log.h"
 #include "ggml-backend-impl.h"
@@ -396,14 +395,8 @@ static void * ggml_backend_awnpu_buffer_get_base(ggml_backend_buffer_t buffer) {
 // 指针和布局主要由 ggml_backend_tensor_alloc / ggml_backend_view_init 及上游分配器在 CPU 上完成，
 // ggml_backend_buffer_init_tensor 只是随后调用可选的 iface.init_tensor
 static enum ggml_status ggml_backend_awnpu_buffer_init_tensor(ggml_backend_buffer_t buffer, struct ggml_tensor * tensor) {
-    if (buffer != nullptr && tensor != nullptr &&
-        ggml_backend_awnpu_buffer_name_is_npu(ggml_backend_buffer_name(buffer))) {
-        ggml_backend_awnpu_record_layer_placement(tensor, true);
-        if (ggml_backend_awnpu_is_output_weight_name(tensor->name)) {
-            ggml_backend_awnpu_set_output_on_npu(true);
-        }
-    }
     GGML_UNUSED(buffer);
+    GGML_UNUSED(tensor);
     return GGML_STATUS_SUCCESS;
 }
 
@@ -745,7 +738,7 @@ static ggml_backend_buffer_type_t ggml_backend_awnpu_device_get_host_buffer_type
     return ggml_backend_cpu_buffer_type();
 }
 
-// AWNPU 接管 NPU 层（权重在 AWNPU buft）上的 op；其余由 scheduler 按 -ngl 切分与传播决定。
+// AWNPU 接管权重/KV 在 AWNPU buft 上的 op 及其图传播可达的中间 node。
 static bool ggml_backend_awnpu_device_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
     GGML_UNUSED(dev);
     if (op == nullptr) {
@@ -761,36 +754,20 @@ static bool ggml_backend_awnpu_device_supports_op(ggml_backend_dev_t dev, const 
         if (rows == nullptr) {
             return false;
         }
-        // Input embedding lookup: always CPU (merge with CPU prefix layers).
-        if (ggml_backend_awnpu_is_input_embedding_weight(rows)) {
-            return false;
-        }
         if (rows->buffer != nullptr &&
             rows->buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
-            return false;
+            return ggml_backend_awnpu_weight_on_npu(rows);
         }
-        // Last-layer inp_out_ids / MoE row select: follow activation src.
-        return ggml_backend_awnpu_node_runs_on_npu(rows, 0);
+        std::unordered_set<const struct ggml_tensor *> visited;
+        return ggml_backend_awnpu_node_on_npu(rows, 0, &visited);
     }
 
     if (ggml_backend_awnpu_op_has_npu_weights(op)) {
         return true;
     }
 
-    if (ggml_backend_awnpu_is_output_head_node(op) && ggml_backend_awnpu_lm_head_on_npu()) {
-        return true;
-    }
-
-    const int il = ggml_backend_awnpu_infer_layer_index(op);
-    if (il >= 0) {
-        return ggml_backend_awnpu_layer_on_npu(il);
-    }
-
-    if (!ggml_backend_awnpu_op_supported(op->op)) {
-        return ggml_backend_awnpu_node_runs_on_npu(op, 0);
-    }
-
-    return false;
+    std::unordered_set<const struct ggml_tensor *> visited;
+    return ggml_backend_awnpu_node_on_npu(op, 0, &visited);
 }
 
 // 判断这个 device 能否使用某种 buffer_type。 这个设备能不能处理放在这种内存里的 tensor
@@ -1166,12 +1143,6 @@ static void * ggml_backend_awnpu_get_proc_address(ggml_backend_reg_t reg, const 
     }
     if (std::strcmp(name, "ggml_backend_set_abort_callback") == 0) {
         return (void *) ggml_backend_awnpu_set_abort_callback;
-    }
-    if (std::strcmp(name, "ggml_backend_set_model_n_layer") == 0) {
-        return (void *) ggml_backend_awnpu_set_model_n_layer;
-    }
-    if (std::strcmp(name, "llama_graph_exec_log_get_callbacks") == 0) {
-        return (void *) ggml_backend_awnpu_graph_exec_log_get_callbacks;
     }
     return nullptr;
 }

@@ -7,23 +7,19 @@
 #include <cstring>
 #include <inttypes.h>
 #include <mutex>
-#include <vector>
 
 namespace {
 
 struct llama_graph_exec_log_session {
-    std::mutex                      mutex;
-    std::FILE *                     file           = nullptr;
-    bool                            enabled        = false;
-    bool                            want_log       = false;
-    uint64_t                        node_counter   = 0;
-    llama_graph_exec_log_callbacks  callbacks      {};
-    bool                            callbacks_set  = false;
-    std::vector<ggml_backend_reg_t> regs;
+    std::mutex  mutex;
+    std::FILE * file         = nullptr;
+    bool        enabled      = false;
+    bool        want_log     = false;
+    uint64_t    node_counter = 0;
 };
 
 llama_graph_exec_log_session g_session;
-thread_local int g_node_done_suppression = 0;
+thread_local int  g_node_done_suppression = 0;
 thread_local bool g_current_node_fallback = false;
 
 static bool env_enabled(void) {
@@ -113,31 +109,6 @@ static void write_split_header(
     std::fflush(g_session.file);
 }
 
-static bool load_callbacks_from_regs(void) {
-    static const char * const k_get_callbacks = "llama_graph_exec_log_get_callbacks";
-
-    for (ggml_backend_reg_t reg : g_session.regs) {
-        if (reg == nullptr) {
-            continue;
-        }
-
-        auto get_fn = (llama_graph_exec_log_get_callbacks_t)
-            ggml_backend_reg_get_proc_address(reg, k_get_callbacks);
-        if (get_fn == nullptr) {
-            continue;
-        }
-
-        const llama_graph_exec_log_callbacks * cb = get_fn();
-        if (cb != nullptr) {
-            g_session.callbacks     = *cb;
-            g_session.callbacks_set = true;
-            return true;
-        }
-    }
-
-    return false;
-}
-
 static bool ensure_enabled(void) {
     static std::once_flag enable_once;
 
@@ -145,8 +116,6 @@ static bool ensure_enabled(void) {
         if (!g_session.want_log) {
             return;
         }
-
-        load_callbacks_from_regs();
 
         g_session.file = std::fopen("llama_graph_exec.log", "w+");
         if (g_session.file == nullptr) {
@@ -172,10 +141,6 @@ static void exec_log_before_split_compute(
 
     if (!ensure_enabled() || backend == nullptr || cgraph == nullptr) {
         return;
-    }
-
-    if (g_session.callbacks_set && g_session.callbacks.on_graph_begin != nullptr) {
-        g_session.callbacks.on_graph_begin(g_session.callbacks.user_data, backend, cgraph);
     }
 
     write_split_header(backend, cgraph);
@@ -216,39 +181,18 @@ static void exec_log_node_done(
 
 } // namespace
 
-void llama_graph_exec_log_prepare(ggml_backend_reg_t * regs, size_t n_regs) {
+void llama_graph_exec_log_prepare(void) {
     if (!env_enabled()) {
         return;
     }
 
     g_session.want_log = true;
-    g_session.regs.clear();
-
-    for (size_t i = 0; i < n_regs; ++i) {
-        ggml_backend_reg_t reg = regs != nullptr ? regs[i] : nullptr;
-        if (reg == nullptr) {
-            continue;
-        }
-
-        bool seen = false;
-        for (ggml_backend_reg_t existing : g_session.regs) {
-            if (existing == reg) {
-                seen = true;
-                break;
-            }
-        }
-
-        if (!seen) {
-            g_session.regs.push_back(reg);
-        }
-    }
 
     static std::once_flag hook_once;
     std::call_once(hook_once, []() {
         ggml_backend_set_graph_split_begin_callback(exec_log_before_split_compute, nullptr);
         ggml_backend_set_graph_node_done_callback(exec_log_node_done, nullptr);
     });
-
 }
 
 void llama_graph_exec_log_suspend_node_done(void) {
