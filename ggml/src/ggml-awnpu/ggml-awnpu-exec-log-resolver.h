@@ -1,12 +1,7 @@
 #pragma once
 
-typedef struct ggml_backend_awnpu_graph_split {
-    int prefix_end;
-    int suffix_start;
-} ggml_backend_awnpu_graph_split;
+#include "llama-graph-exec-log.h"
 
-struct llama_graph_exec_log_callbacks;
-
-const struct llama_graph_exec_log_callbacks * ggml_backend_awnpu_graph_exec_log_get_callbacks(void);
-
-ggml_backend_awnpu_graph_split ggml_backend_awnpu_detect_graph_split(const struct ggml_cgraph * cgraph);
+// AWNPU-specific llama_graph_exec_log resolver.
+// Exported to llama-graph-exec-log via ggml_backend_reg_get_proc_address("llama_graph_exec_log_get_callbacks").
+const llama_graph_exec_log_callbacks * ggml_backend_awnpu_graph_exec_log_get_callbacks(void);

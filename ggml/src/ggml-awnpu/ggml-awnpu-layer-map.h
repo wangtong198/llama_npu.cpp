@@ -34,11 +34,3 @@ bool ggml_backend_awnpu_node_is_layout_only(const struct ggml_tensor * node);
 bool ggml_backend_awnpu_node_runs_on_npu(const struct ggml_tensor * node, int depth);
 
 void ggml_backend_awnpu_build_layer_map(const struct ggml_cgraph * cgraph);
-
-const char * ggml_backend_awnpu_buffer_logical_backend_name(
-        ggml_backend_t awnpu_backend,
-        ggml_backend_buffer_t buffer);
-
-const char * ggml_backend_awnpu_tensor_logical_backend_name(
-        ggml_backend_t awnpu_backend,
-        const struct ggml_tensor * tensor);

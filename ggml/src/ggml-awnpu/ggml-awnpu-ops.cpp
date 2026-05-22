@@ -1,36 +1,23 @@
 #include "ggml-awnpu-ops.h"
 
+#include "ggml-awnpu-layer-map.h"
 #include "ggml-impl.h"
+#include "ggml.h"
 
-static enum ggml_status ggml_backend_awnpu_sim_forward_to_node(
-        void * ctx,
-        const struct ggml_backend_awnpu_op_dispatch * dispatch,
-        struct ggml_cgraph * cgraph,
-        int node_idx) {
-    GGML_ASSERT(ctx != nullptr);
-    GGML_ASSERT(dispatch != nullptr);
-    GGML_ASSERT(dispatch->get_last_node_idx != nullptr);
-    GGML_ASSERT(dispatch->set_last_node_idx != nullptr);
-    GGML_ASSERT(dispatch->forward_range != nullptr);
-    GGML_ASSERT(cgraph != nullptr);
-
-    const int i1 = node_idx + 1;
-    const int last_node_idx = dispatch->get_last_node_idx(ctx);
-    const int i0 = last_node_idx < 0 ? 0 : last_node_idx;
-
-    if (i1 <= i0) {
-        return GGML_STATUS_SUCCESS;
+static bool ggml_backend_awnpu_op_is_layout_only(enum ggml_op op) {
+    switch (op) {
+        case GGML_OP_NONE:
+        case GGML_OP_RESHAPE:
+        case GGML_OP_VIEW:
+        case GGML_OP_PERMUTE:
+        case GGML_OP_TRANSPOSE:
+            return true;
+        default:
+            return false;
     }
-
-    const enum ggml_status status = dispatch->forward_range(ctx, cgraph, i0, i1);
-    if (status == GGML_STATUS_SUCCESS) {
-        dispatch->set_last_node_idx(ctx, i1);
-    }
-
-    return status;
 }
 
-static bool ggml_backend_awnpu_op_is_supported(enum ggml_op op) {
+static bool ggml_backend_awnpu_op_is_compute_supported(enum ggml_op op) {
     switch (op) {
         case GGML_OP_GET_ROWS:
         case GGML_OP_MUL_MAT:
@@ -66,35 +53,74 @@ static bool ggml_backend_awnpu_op_is_supported(enum ggml_op op) {
 }
 
 bool ggml_backend_awnpu_op_supported(enum ggml_op op) {
-    return ggml_backend_awnpu_op_is_supported(op);
+    return ggml_backend_awnpu_op_is_layout_only(op) || ggml_backend_awnpu_op_is_compute_supported(op);
 }
 
-enum ggml_status ggml_backend_awnpu_compute_node_sim_op(
-        void * ctx,
-        const struct ggml_backend_awnpu_op_dispatch * dispatch,
-        struct ggml_cgraph * cgraph,
-        int node_idx,
-        struct ggml_tensor * node) {
-    GGML_ASSERT(node != nullptr);
-
-    if (ggml_backend_awnpu_op_is_supported(node->op)) {
-        return ggml_backend_awnpu_sim_forward_to_node(ctx, dispatch, cgraph, node_idx);
-    }
-
-    return GGML_STATUS_FAILED;
+static bool ggml_backend_awnpu_npu_abort_requested(
+        ggml_abort_callback abort_callback,
+        void * abort_callback_data) {
+    return abort_callback != nullptr && abort_callback(abort_callback_data);
 }
 
-enum ggml_status ggml_backend_awnpu_compute_node_op(
-        void * ctx,
+static enum ggml_status ggml_backend_awnpu_npu_compute_op(
+        int device_id,
         struct ggml_tensor * node) {
+    GGML_UNUSED(device_id);
     GGML_ASSERT(node != nullptr);
-    GGML_UNUSED(ctx);
 
-    if (!ggml_backend_awnpu_op_is_supported(node->op)) {
-        return GGML_STATUS_FAILED;
+    if (ggml_backend_awnpu_op_is_layout_only(node->op)) {
+        return GGML_STATUS_SUCCESS;
     }
 
-    GGML_LOG_ERROR("%s: non-sim AWNPU execution is not implemented for op %s (%s)\n",
-            __func__, ggml_op_name(node->op), node->name);
-    return GGML_STATUS_FAILED;
+    switch (node->op) {
+        case GGML_OP_GET_ROWS:
+        case GGML_OP_MUL_MAT:
+        case GGML_OP_MUL_MAT_ID:
+        case GGML_OP_ADD:
+        case GGML_OP_ADD_ID:
+        case GGML_OP_ADD1:
+        case GGML_OP_MUL:
+        case GGML_OP_DIV:
+        case GGML_OP_SUB:
+        case GGML_OP_SQR:
+        case GGML_OP_SQRT:
+        case GGML_OP_LOG:
+        case GGML_OP_UNARY:
+        case GGML_OP_NORM:
+        case GGML_OP_RMS_NORM:
+        case GGML_OP_SOFT_MAX:
+        case GGML_OP_ROPE:
+        case GGML_OP_ROPE_BACK:
+        case GGML_OP_SCALE:
+        case GGML_OP_CLAMP:
+        case GGML_OP_SET_ROWS:
+        case GGML_OP_GLU:
+        case GGML_OP_FLASH_ATTN_EXT:
+        case GGML_OP_CPY:
+        case GGML_OP_CONT:
+        case GGML_OP_DUP:
+        case GGML_OP_PAD:
+            // Per-op NPU kernels are implemented here.
+            return GGML_STATUS_FAILED;
+        default:
+            return GGML_STATUS_FAILED;
+    }
+}
+
+enum ggml_status ggml_backend_awnpu_npu_compute_node(
+        int device_id,
+        struct ggml_tensor * node,
+        ggml_abort_callback abort_callback,
+        void * abort_callback_data) {
+    GGML_ASSERT(node != nullptr);
+
+    if (ggml_backend_awnpu_npu_abort_requested(abort_callback, abort_callback_data)) {
+        return GGML_STATUS_ABORTED;
+    }
+
+    if (ggml_backend_awnpu_node_is_layout_only(node)) {
+        return GGML_STATUS_SUCCESS;
+    }
+
+    return ggml_backend_awnpu_npu_compute_op(device_id, node);
 }

@@ -1,7 +1,7 @@
 #include "ggml-awnpu.h"
 
-#include "ggml-awnpu-exec-log-resolver.h"
 #include "ggml-awnpu-layer-map.h"
+#include "ggml-awnpu-exec-log-resolver.h"
 #include "ggml-awnpu-ops.h"
 #include "llama-graph-exec-log.h"
 #include "ggml-backend-impl.h"
@@ -54,12 +54,15 @@ struct ggml_backend_awnpu_device_context {
 
 // 这些字段不是“AWNPU 硬件必须有的状态”，而是 backend 执行图时的宿主机上下文。
 struct ggml_backend_awnpu_context {
-    int n_threads = 1;  // CPU fallback 计算时用多少线程
+    // CPU fallback 计算时，控制 CPU 算子并行线程数
+    int n_threads = 1;  
+    // CPU fallback 计算时，传给 cplan.use_ref，是否用 reference 实现（ref=1 参数）
     bool use_ref = false;
+    // CPU fallback 计算时，CPU graph compute 的工作缓冲区，按 cplan.work_size 按需分配/复用
     void * work_data = nullptr;
     size_t work_size = 0;
-    bool sim_enabled = false;
-    int sim_last_node_idx = -1; // sim 增量子图执行上界（不含）
+    
+    int device_id = 0;
     // 图执行中的中断回调
     // 用于外部请求停止推理时，执行过程能及时退出
     // 对 NPU 来说，如果未来接真实 runtime，也可以映射成设备执行过程中的取消/中止检查。
@@ -133,18 +136,6 @@ static bool ggml_backend_awnpu_parse_bool_env(const char * name, bool def = fals
     return def;
 }
 
-static bool ggml_backend_awnpu_sim_enabled(void) {
-    static std::atomic<int> cached {-1};
-
-    int value = cached.load(std::memory_order_acquire);
-    if (value == -1) {
-        value = ggml_backend_awnpu_parse_bool_env("AWNPU_LLM_SIM", false) ? 1 : 0;
-        cached.store(value, std::memory_order_release);
-    }
-
-    return value == 1;
-}
-
 static bool ggml_backend_awnpu_sim_probe_enabled(void) {
     static std::atomic<int> cached {-1};
 
@@ -177,7 +168,7 @@ static std::string ggml_backend_awnpu_fallback_warning_key(const struct ggml_ten
 
     std::string key = ggml_op_name(node->op);
     key += '|';
-    key += node->name;
+    key += ggml_type_name(node->type);
     key += '|';
     key += std::to_string((int64_t) node->ne[0]);
     key += 'x';
@@ -192,7 +183,7 @@ static std::string ggml_backend_awnpu_fallback_warning_key(const struct ggml_ten
 static bool ggml_backend_awnpu_warn_fallback_once(
         const char * func_name,
         const struct ggml_tensor * node,
-        bool sim_enabled) {
+        bool op_supported) {
     GGML_ASSERT(node != nullptr);
     GGML_ASSERT(func_name != nullptr);
 
@@ -204,12 +195,14 @@ static bool ggml_backend_awnpu_warn_fallback_once(
     std::lock_guard<std::mutex> lock(mutex);
     const bool inserted = seen.insert(key).second;
     if (inserted) {
-        if (sim_enabled) {
-            GGML_LOG_WARN("%s: AWNPU op %s (%s) is not implemented, fallback to CPU\n",
-                    func_name, ggml_op_name(node->op), node->name);
+        if (!op_supported) {
+            GGML_LOG_WARN("%s: AWNPU op %s type=%s shape=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] is not supported, fallback to CPU\n",
+                    func_name, ggml_op_name(node->op), ggml_type_name(node->type),
+                    (int64_t) node->ne[0], (int64_t) node->ne[1], (int64_t) node->ne[2], (int64_t) node->ne[3]);
         } else {
-            GGML_LOG_WARN("%s: non-sim AWNPU execution is not implemented for op %s (%s), fallback to CPU\n",
-                    func_name, ggml_op_name(node->op), node->name);
+            GGML_LOG_WARN("%s: NPU execution is not implemented for op %s type=%s shape=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "], fallback to CPU\n",
+                    func_name, ggml_op_name(node->op), ggml_type_name(node->type),
+                    (int64_t) node->ne[0], (int64_t) node->ne[1], (int64_t) node->ne[2], (int64_t) node->ne[3]);
         }
     }
 
@@ -218,7 +211,6 @@ static bool ggml_backend_awnpu_warn_fallback_once(
 
 extern const struct ggml_backend_buffer_i ggml_backend_awnpu_buffer_i;
 extern const struct ggml_backend_i ggml_backend_awnpu_i;
-static enum ggml_status ggml_backend_awnpu_graph_compute_cpu(ggml_backend_t backend, struct ggml_cgraph * cgraph);
 static enum ggml_status ggml_backend_awnpu_cpu_forward_range(
         ggml_backend_awnpu_context * ctx,
         struct ggml_cgraph * cgraph,
@@ -282,10 +274,6 @@ static bool ggml_backend_awnpu_probe(ggml_backend_awnpu_probe_info * info) {
     GGML_ASSERT(info != nullptr);
 
     if (ggml_backend_awnpu_sim_probe_enabled()) {
-        return ggml_backend_awnpu_probe_simulated(info);
-    }
-
-    if (ggml_backend_awnpu_sim_enabled()) {
         return ggml_backend_awnpu_probe_simulated(info);
     }
 
@@ -851,16 +839,12 @@ static bool ggml_backend_awnpu_op_has_npu_weights(const struct ggml_tensor * op)
 // - device 是硬件实体
 // - backend 是这个硬件上的一次运行实例
 static ggml_backend_t ggml_backend_awnpu_device_init_backend(ggml_backend_dev_t dev, const char * params) {
-    GGML_UNUSED(dev);
+    auto * dev_ctx = dev != nullptr ? (ggml_backend_awnpu_device_context *) dev->context : nullptr;
 
     auto * backend_ctx = new ggml_backend_awnpu_context;
     backend_ctx->n_threads = std::max(1, ggml_backend_awnpu_parse_int_env("GGML_AWNPU_THREADS", (int) std::max(1u, std::thread::hardware_concurrency())));
     backend_ctx->use_ref = false;
-    backend_ctx->sim_enabled = ggml_backend_awnpu_sim_enabled();
-
-    if (backend_ctx->sim_enabled) {
-        GGML_LOG_INFO("%s: AWNPU_LLM_SIM enabled\n", __func__);
-    }
+    backend_ctx->device_id = dev_ctx != nullptr ? dev_ctx->device : 0;
 
     if (params != nullptr) {
         const std::string p = params;
@@ -939,88 +923,7 @@ static void ggml_backend_awnpu_set_abort_callback(ggml_backend_t backend, ggml_a
 }
 
 
-static int ggml_backend_awnpu_sim_get_last_node_idx(const void * ctx_ptr) {
-    const auto * ctx = (const ggml_backend_awnpu_context *) ctx_ptr;
-    GGML_ASSERT(ctx != nullptr);
-    return ctx->sim_last_node_idx;
-}
-
-static void ggml_backend_awnpu_sim_set_last_node_idx(void * ctx_ptr, int node_idx) {
-    auto * ctx = (ggml_backend_awnpu_context *) ctx_ptr;
-    GGML_ASSERT(ctx != nullptr);
-    ctx->sim_last_node_idx = node_idx;
-}
-
-static enum ggml_status ggml_backend_awnpu_sim_forward_range_cb(
-        void * ctx_ptr,
-        struct ggml_cgraph * cgraph,
-        int i0,
-        int i1) {
-    auto * ctx = (ggml_backend_awnpu_context *) ctx_ptr;
-    GGML_ASSERT(ctx != nullptr);
-    return ggml_backend_awnpu_cpu_forward_range(ctx, cgraph, i0, i1);
-}
-
-static const ggml_backend_awnpu_op_dispatch ggml_backend_awnpu_sim_op_dispatch = {
-    /* .get_last_node_idx = */ ggml_backend_awnpu_sim_get_last_node_idx,
-    /* .set_last_node_idx = */ ggml_backend_awnpu_sim_set_last_node_idx,
-    /* .forward_range     = */ ggml_backend_awnpu_sim_forward_range_cb,
-};
-
-static ggml_backend_t ggml_backend_awnpu_init_cpu_backend(ggml_backend_t backend) {
-    auto * ctx = (ggml_backend_awnpu_context *) backend->context;
-    GGML_ASSERT(ctx != nullptr);
-
-    using ggml_backend_set_n_threads_fn = void (*)(ggml_backend_t, int);
-    using ggml_backend_set_abort_callback_fn = void (*)(ggml_backend_t, ggml_abort_callback, void *);
-
-    ggml_backend_t cpu_backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
-    if (cpu_backend == nullptr) {
-        return nullptr;
-    }
-
-    auto * reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(cpu_backend));
-    auto * set_n_threads_fn = (ggml_backend_set_n_threads_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_n_threads");
-    if (set_n_threads_fn != nullptr) {
-        set_n_threads_fn(cpu_backend, ctx->n_threads);
-    }
-
-    auto * set_abort_callback_fn = (ggml_backend_set_abort_callback_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_abort_callback");
-    if (set_abort_callback_fn != nullptr) {
-        set_abort_callback_fn(cpu_backend, ctx->abort_callback, ctx->abort_callback_data);
-    }
-
-    return cpu_backend;
-}
-
-
-static enum ggml_status ggml_backend_awnpu_prepare_cplan(
-        ggml_backend_awnpu_context * ctx,
-        const struct ggml_cgraph * cgraph,
-        struct ggml_cplan * cplan) {
-    GGML_ASSERT(ctx != nullptr);
-    GGML_ASSERT(cgraph != nullptr);
-    GGML_ASSERT(cplan != nullptr);
-
-    *cplan = ggml_graph_plan(cgraph, ctx->n_threads, nullptr);
-    if (ctx->work_size < cplan->work_size) {
-        ggml_aligned_free(ctx->work_data, ctx->work_size);
-        ctx->work_data = ggml_aligned_malloc(cplan->work_size);
-        if (ctx->work_data == nullptr && cplan->work_size > 0) {
-            ctx->work_size = 0;
-            return GGML_STATUS_ALLOC_FAILED;
-        }
-        ctx->work_size = cplan->work_size;
-    }
-
-    cplan->work_data            = (uint8_t *) ctx->work_data;
-    cplan->abort_callback       = ctx->abort_callback;
-    cplan->abort_callback_data  = ctx->abort_callback_data;
-    cplan->use_ref              = ctx->use_ref;
-    return GGML_STATUS_SUCCESS;
-}
-
-// sim：执行子图 [i0, i1)，包含中间 layout 节点，保证 SET_ROWS 等依赖正确。
+// 执行单 node 子图 [node_idx, node_idx + 1)。
 static enum ggml_status ggml_backend_awnpu_cpu_forward_range(
         ggml_backend_awnpu_context * ctx,
         struct ggml_cgraph * cgraph,
@@ -1055,36 +958,66 @@ static enum ggml_status ggml_backend_awnpu_cpu_forward_range(
     return ggml_graph_compute(&gv, &cplan);
 }
 
-static enum ggml_status ggml_backend_awnpu_compute_node_npu(
+static enum ggml_status ggml_backend_awnpu_forward_cpu_node(
+        ggml_backend_awnpu_context * ctx,
+        struct ggml_cgraph * cgraph,
+        int node_idx) {
+    return ggml_backend_awnpu_cpu_forward_range(ctx, cgraph, node_idx, node_idx + 1);
+}
+
+static enum ggml_status ggml_backend_awnpu_forward_npu_node(
+        ggml_backend_awnpu_context * ctx,
+        struct ggml_tensor * node) {
+    GGML_ASSERT(ctx != nullptr);
+    GGML_ASSERT(node != nullptr);
+
+    return ggml_backend_awnpu_npu_compute_node(
+            ctx->device_id,
+            node,
+            ctx->abort_callback,
+            ctx->abort_callback_data);
+}
+
+static enum ggml_status ggml_backend_awnpu_fallback_cpu_node(
+        ggml_backend_awnpu_context * ctx,
+        struct ggml_cgraph * cgraph,
+        int node_idx,
+        const struct ggml_tensor * node,
+        bool op_supported) {
+    ggml_backend_awnpu_warn_fallback_once(__func__, node, op_supported);
+    llama_graph_exec_log_set_current_node_fallback(true);
+
+    llama_graph_exec_log_suspend_node_done();
+    const enum ggml_status status = ggml_backend_awnpu_forward_cpu_node(ctx, cgraph, node_idx);
+    llama_graph_exec_log_resume_node_done();
+    return status;
+}
+
+static enum ggml_status ggml_backend_awnpu_compute_node(
         ggml_backend_t backend,
         struct ggml_cgraph * cgraph,
         int node_idx,
-        struct ggml_cplan * cplan,
         struct ggml_tensor * node) {
     auto * ctx = (ggml_backend_awnpu_context *) backend->context;
     GGML_ASSERT(ctx != nullptr);
     GGML_ASSERT(node != nullptr);
-    GGML_UNUSED(cplan);
 
-    if (ctx->sim_enabled && ggml_backend_awnpu_op_supported(node->op)) {
-        return ggml_backend_awnpu_compute_node_sim_op(
-                ctx,
-                &ggml_backend_awnpu_sim_op_dispatch,
-                cgraph,
-                node_idx,
-                node);
+    if (ggml_backend_awnpu_node_is_layout_only(node)) {
+        return GGML_STATUS_SUCCESS; //  ggml_backend_awnpu_forward_npu_node(ctx, node);
     }
 
-    ggml_backend_awnpu_warn_fallback_once(__func__, node, ctx->sim_enabled);
-    llama_graph_exec_log_set_current_node_fallback(true);
-
-    llama_graph_exec_log_suspend_node_done();
-    const enum ggml_status status = ggml_backend_awnpu_cpu_forward_range(ctx, cgraph, node_idx, node_idx + 1);
-    llama_graph_exec_log_resume_node_done();
-    if (status == GGML_STATUS_SUCCESS) {
-        ctx->sim_last_node_idx = node_idx + 1;
+    if (!ggml_backend_awnpu_op_supported(node->op)) {
+        return ggml_backend_awnpu_fallback_cpu_node(
+                ctx, cgraph, node_idx, node, false);
     }
-    return status;
+
+    const enum ggml_status status = ggml_backend_awnpu_forward_npu_node(ctx, node);
+    if (status == GGML_STATUS_SUCCESS || status == GGML_STATUS_ABORTED) {
+        return status;
+    }
+
+    return ggml_backend_awnpu_fallback_cpu_node(
+            ctx, cgraph, node_idx, node, true);
 }
 
 static enum ggml_status ggml_backend_awnpu_graph_compute_npu(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
@@ -1093,8 +1026,6 @@ static enum ggml_status ggml_backend_awnpu_graph_compute_npu(ggml_backend_t back
 
     auto * ctx = (ggml_backend_awnpu_context *) backend->context;
     GGML_ASSERT(ctx != nullptr);
-
-    ctx->sim_last_node_idx = -1;
 
     const bool log_nodes = ggml_backend_graph_node_done_callback_is_set();
 
@@ -1107,19 +1038,12 @@ static enum ggml_status ggml_backend_awnpu_graph_compute_npu(ggml_backend_t back
             continue;
         }
 
-        if (ggml_backend_awnpu_node_is_layout_only(node)) {
-            if (log_nodes) {
-                ggml_backend_invoke_graph_node_done_callback(backend, cgraph, i, 0);
-            }
-            continue;
-        }
-
         int64_t t0 = 0;
         if (log_nodes) {
             t0 = ggml_time_us();
         }
 
-        status = ggml_backend_awnpu_compute_node_npu(backend, cgraph, i, nullptr, node);
+        status = ggml_backend_awnpu_compute_node(backend, cgraph, i, node);
 
         if (log_nodes) {
             ggml_backend_invoke_graph_node_done_callback(backend, cgraph, i, ggml_time_us() - t0);
@@ -1147,19 +1071,6 @@ static enum ggml_status ggml_backend_awnpu_graph_compute_npu(ggml_backend_t back
 如果 backend 支持异步，这个接口通常也会是异步提交式；
 如果不支持异步，也可能是同步执行后返回。
 */
-static enum ggml_status ggml_backend_awnpu_graph_compute_cpu(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
-    auto * ctx = (ggml_backend_awnpu_context *) backend->context;
-    GGML_ASSERT(ctx != nullptr);
-
-    struct ggml_cplan cplan {};
-    enum ggml_status status = ggml_backend_awnpu_prepare_cplan(ctx, cgraph, &cplan);
-    if (status != GGML_STATUS_SUCCESS) {
-        return status;
-    }
-
-    return ggml_graph_compute(cgraph, &cplan);
-}
-
 static enum ggml_status ggml_backend_awnpu_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
     auto * ctx = (ggml_backend_awnpu_context *) backend->context;
     GGML_ASSERT(ctx != nullptr);
@@ -1168,43 +1079,8 @@ static enum ggml_status ggml_backend_awnpu_graph_compute(ggml_backend_t backend,
         return GGML_STATUS_SUCCESS;
     }
 
-    const ggml_backend_awnpu_graph_split split = ggml_backend_awnpu_detect_graph_split(cgraph);
-
-    ggml_backend_t cpu_backend = ggml_backend_awnpu_init_cpu_backend(backend);
-
-    if (cpu_backend == nullptr) {
-        return ggml_backend_awnpu_graph_compute_cpu(backend, cgraph);
-    }
-
-    enum ggml_status status = GGML_STATUS_SUCCESS;
-
-    if (split.prefix_end > 0) {
-        struct ggml_cgraph prefix_graph = ggml_graph_view(cgraph, 0, split.prefix_end);
-        status = ggml_backend_graph_compute(cpu_backend, &prefix_graph);
-        if (status != GGML_STATUS_SUCCESS) {
-            goto done;
-        }
-    }
-
-    if (split.prefix_end < split.suffix_start) {
-        struct ggml_cgraph middle_graph = ggml_graph_view(cgraph, split.prefix_end, split.suffix_start);
-        status = ggml_backend_awnpu_graph_compute_npu(backend, &middle_graph);
-        if (status != GGML_STATUS_SUCCESS) {
-            goto done;
-        }
-    }
-
-    if (split.suffix_start < cgraph->n_nodes) {
-        struct ggml_cgraph suffix_graph = ggml_graph_view(cgraph, split.suffix_start, cgraph->n_nodes);
-        status = ggml_backend_graph_compute(cpu_backend, &suffix_graph);
-        if (status != GGML_STATUS_SUCCESS) {
-            goto done;
-        }
-    }
-
-done:
-    ggml_backend_free(cpu_backend);
-    return status;
+    // Scheduler splits by layer/weight placement; per-node NPU/CPU fallback is handled in graph_compute_npu.
+    return ggml_backend_awnpu_graph_compute_npu(backend, cgraph);
 }
 
 /*

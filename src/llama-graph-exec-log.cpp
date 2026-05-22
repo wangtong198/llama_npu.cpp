@@ -264,7 +264,3 @@ void llama_graph_exec_log_resume_node_done(void) {
 void llama_graph_exec_log_set_current_node_fallback(bool fallback) {
     g_current_node_fallback = fallback;
 }
-
-bool llama_graph_exec_log_current_node_is_fallback(void) {
-    return g_current_node_fallback;
-}

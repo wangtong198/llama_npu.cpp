@@ -10,27 +10,10 @@ extern "C" {
 typedef struct llama_graph_exec_log_callbacks {
     void * user_data;
 
-    const char * (*resolve_node_exec)(
-            void * user_data,
-            ggml_backend_t dispatch,
-            const struct ggml_tensor * node);
-
-    const char * (*resolve_tensor)(
-            void * user_data,
-            ggml_backend_t dispatch,
-            const struct ggml_tensor * tensor);
-
     void (*on_graph_begin)(
             void * user_data,
             ggml_backend_t dispatch,
             const struct ggml_cgraph * graph);
-
-    bool (*is_layout_only)(void * user_data, const struct ggml_tensor * node);
-
-    bool (*is_fallback)(
-            void * user_data,
-            ggml_backend_t dispatch,
-            const struct ggml_tensor * node);
 } llama_graph_exec_log_callbacks;
 
 typedef const llama_graph_exec_log_callbacks * (*llama_graph_exec_log_get_callbacks_t)(void);
@@ -44,7 +27,6 @@ GGML_API void llama_graph_exec_log_resume_node_done(void);
 
 // Mark the current node as running through a CPU fallback path.
 GGML_API void llama_graph_exec_log_set_current_node_fallback(bool fallback);
-GGML_API bool llama_graph_exec_log_current_node_is_fallback(void);
 
 #ifdef __cplusplus
 }
