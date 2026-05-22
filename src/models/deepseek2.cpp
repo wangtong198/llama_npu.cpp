@@ -48,7 +48,7 @@ llm_build_deepseek2::llm_build_deepseek2(const llama_model & model, const llm_gr
 
     ggml_tensor * inp_out_ids = build_inp_out_ids();
 
-    int effective_n_layers = hparams.n_layer - hparams.nextn_predict_layers;
+    int effective_n_layers = n_layer - hparams.nextn_predict_layers;
     for (int il = 0; il < effective_n_layers; ++il) {
         ggml_tensor * inpSA = inpL;
 

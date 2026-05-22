@@ -43,6 +43,7 @@ struct llama_hparams {
     uint32_t n_ctx_train; // context size the model was trained on
     uint32_t n_embd;
     uint32_t n_layer;
+    int32_t n_load_layers = -1; // partial load via LOAD_LAYERS env (-1 = all layers)
     int32_t n_layer_kv_from_start = -1; // if non-negative, the first n_layer_kv_from_start layers have KV cache
     uint32_t n_expert = 0;
     uint32_t n_expert_used = 0;
@@ -308,6 +309,14 @@ struct llama_hparams {
 
     // number of layers for which has_kv() returns true
     uint32_t n_layer_kv() const;
+
+    // transformer blocks to run in forward pass (-1 / unset = all)
+    uint32_t n_layer_forward() const {
+        if (n_load_layers > 0) {
+            return (uint32_t) n_load_layers;
+        }
+        return n_layer;
+    }
 
     // note that this function uses different SWA parameters from those in the hparams
     // note: inlined on purpose for performance reasons

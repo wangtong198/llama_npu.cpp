@@ -22,6 +22,7 @@
 #include <cassert>
 #include <cfloat>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <cmath>
 #include <functional>
@@ -2963,6 +2964,28 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
     const int n_layer      = hparams.n_layer;
     const int n_gpu_layers = this->n_gpu_layers();
 
+    if (const char * env = std::getenv("LOAD_LAYERS")) {
+        char * end = nullptr;
+        const long n_ll = std::strtol(env, &end, 10);
+        if (end == env || *end != '\0') {
+            throw std::runtime_error(format("%s: invalid LOAD_LAYERS=%s", __func__, env));
+        }
+        if (n_ll <= 0) {
+            throw std::runtime_error(format("%s: LOAD_LAYERS=%ld must be > 0", __func__, n_ll));
+        }
+        if (n_ll > n_layer) {
+            LLAMA_LOG_WARN("%s: LOAD_LAYERS=%ld > n_layer=%d, loading all %d transformer layers\n",
+                __func__, n_ll, n_layer, n_layer);
+            hparams.n_load_layers = n_layer;
+        } else {
+            hparams.n_load_layers = (int32_t) n_ll;
+            if (n_ll < n_layer) {
+                LLAMA_LOG_WARN("%s: LOAD_LAYERS=%ld: loading only first %ld/%d transformer layers (results will be incorrect)\n",
+                    __func__, n_ll, n_ll, n_layer);
+            }
+        }
+    }
+
     const bool use_mmap_buffer = true;
 
     LLAMA_LOG_INFO("%s: loading model tensors, this can take a while... (mmap = %s, direct_io = %s)\n",
@@ -3075,6 +3098,9 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
         }
 
         auto create_tensor = [&](const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) -> ggml_tensor * {
+            if (hparams.n_load_layers > 0 && tn.bid >= hparams.n_load_layers) {
+                flags |= TENSOR_SKIP;
+            }
             const buft_list_t * buft_list_layer = tn.bid == -1 ? nullptr : pimpl->dev_layer.at(tn.bid).buft_list;
             return ml.create_tensor(
                 hparams, &pimpl->cpu_buft_list, pimpl->dev_input.buft_list, pimpl->dev_output.buft_list, buft_list_layer,
@@ -8365,6 +8391,9 @@ void llama_model::print_info() const {
         LLAMA_LOG_INFO("%s: n_embd                = %u\n",     __func__, hparams.n_embd);
         LLAMA_LOG_INFO("%s: n_embd_inp            = %u\n",     __func__, hparams.n_embd_inp());
         LLAMA_LOG_INFO("%s: n_layer               = %u\n",     __func__, hparams.n_layer);
+        if (hparams.n_load_layers > 0) {
+            LLAMA_LOG_INFO("%s: n_load_layers         = %d\n",     __func__, hparams.n_load_layers);
+        }
         LLAMA_LOG_INFO("%s: n_head                = %s\n",     __func__, print_f([&](uint32_t il) { return hparams.n_head(il);    }, hparams.n_layer).c_str());
         LLAMA_LOG_INFO("%s: n_head_kv             = %s\n",     __func__, print_f([&](uint32_t il) { return hparams.n_head_kv(il); }, hparams.n_layer).c_str());
         LLAMA_LOG_INFO("%s: n_rot                 = %u\n",     __func__, hparams.n_rot_full);
