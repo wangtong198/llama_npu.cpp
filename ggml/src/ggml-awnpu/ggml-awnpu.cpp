@@ -231,6 +231,7 @@ static enum ggml_status ggml_backend_awnpu_cpu_forward_range(
         struct ggml_cgraph * cgraph,
         int i0,
         int i1);
+static bool ggml_backend_awnpu_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft);
 static bool ggml_backend_awnpu_op_has_npu_weights(const struct ggml_tensor * op);
 
 static void ggml_backend_awnpu_get_host_memory(size_t * memory_free, size_t * memory_total) {
@@ -756,7 +757,6 @@ static ggml_backend_buffer_type_t ggml_backend_awnpu_device_get_host_buffer_type
 
 // AWNPU 接管权重/KV 在 AWNPU buft 上的 op 及其图传播可达的中间 node。
 static bool ggml_backend_awnpu_device_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
-    GGML_UNUSED(dev);
     if (op == nullptr) {
         return false;
     }
@@ -774,8 +774,21 @@ static bool ggml_backend_awnpu_device_supports_op(ggml_backend_dev_t dev, const 
             rows->buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
             return ggml_backend_awnpu_weight_on_npu(rows);
         }
-        std::unordered_set<const struct ggml_tensor *> visited;
-        return ggml_backend_awnpu_node_on_npu(rows, 0, &visited);
+
+        if (!ggml_backend_awnpu_op_supported(op->op)) {
+            return false;
+        }
+
+        ggml_backend_buffer_t rows_buffer = rows->buffer;
+        if (rows_buffer == nullptr && rows->view_src != nullptr) {
+            rows_buffer = rows->view_src->buffer;
+        }
+
+        if (rows_buffer != nullptr) {
+            return ggml_backend_awnpu_device_supports_buft(dev, ggml_backend_buffer_get_type(rows_buffer));
+        }
+
+        return true;
     }
 
     if (ggml_backend_awnpu_op_has_npu_weights(op)) {
