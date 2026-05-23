@@ -1,7 +1,7 @@
 #include "ggml-awnpu.h"
 
 #include "ggml-awnpu-layer-map.h"
-#include "ggml-awnpu-ops.h"
+#include "ggml-awnpu-graph-node.h"
 #include "llama-graph-exec-log.h"
 #include "ggml-backend-impl.h"
 #include "ggml-cpu.h"
@@ -179,29 +179,45 @@ static std::string ggml_backend_awnpu_fallback_warning_key(const struct ggml_ten
     return key;
 }
 
+static const char * ggml_backend_awnpu_tensor_type_name(const struct ggml_tensor * t) {
+    return t ? ggml_type_name(t->type) : "-";
+}
+
 static bool ggml_backend_awnpu_warn_fallback_once(
         const char * func_name,
         const struct ggml_tensor * node,
-        bool op_supported) {
+        const char * reason,
+        enum ggml_status npu_status) {
     GGML_ASSERT(node != nullptr);
     GGML_ASSERT(func_name != nullptr);
+    GGML_ASSERT(reason != nullptr);
 
     static std::mutex mutex;
     static std::unordered_set<std::string> seen;
 
-    const std::string key = ggml_backend_awnpu_fallback_warning_key(node);
+    std::string key = ggml_backend_awnpu_fallback_warning_key(node);
+    key += '|';
+    key += reason;
+
+    const char * name = (node->name != nullptr && node->name[0] != '\0') ? node->name : "-";
 
     std::lock_guard<std::mutex> lock(mutex);
     const bool inserted = seen.insert(key).second;
     if (inserted) {
-        if (!op_supported) {
-            GGML_LOG_WARN("%s: AWNPU op %s type=%s shape=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] is not supported, fallback to CPU\n",
-                    func_name, ggml_op_name(node->op), ggml_type_name(node->type),
+        if (npu_status == GGML_STATUS_SUCCESS) {
+            GGML_LOG_WARN(
+                    "%s: [%s] op=%s name=%s dst=%s shape=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "], fallback to CPU\n",
+                    func_name, reason, ggml_op_name(node->op), name, ggml_type_name(node->type),
                     (int64_t) node->ne[0], (int64_t) node->ne[1], (int64_t) node->ne[2], (int64_t) node->ne[3]);
         } else {
-            GGML_LOG_WARN("%s: NPU execution is not implemented for op %s type=%s shape=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "], fallback to CPU\n",
-                    func_name, ggml_op_name(node->op), ggml_type_name(node->type),
-                    (int64_t) node->ne[0], (int64_t) node->ne[1], (int64_t) node->ne[2], (int64_t) node->ne[3]);
+            GGML_LOG_WARN(
+                    "%s: [%s] op=%s name=%s dst=%s src0=%s src1=%s src2=%s shape=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] status=%d, fallback to CPU\n",
+                    func_name, reason, ggml_op_name(node->op), name, ggml_type_name(node->type),
+                    ggml_backend_awnpu_tensor_type_name(node->src[0]),
+                    ggml_backend_awnpu_tensor_type_name(node->src[1]),
+                    ggml_backend_awnpu_tensor_type_name(node->src[2]),
+                    (int64_t) node->ne[0], (int64_t) node->ne[1], (int64_t) node->ne[2], (int64_t) node->ne[3],
+                    (int) npu_status);
         }
     }
 
@@ -959,9 +975,8 @@ static enum ggml_status ggml_backend_awnpu_fallback_cpu_node(
         ggml_backend_awnpu_context * ctx,
         struct ggml_cgraph * cgraph,
         int node_idx,
-        const struct ggml_tensor * node,
-        bool op_supported) {
-    ggml_backend_awnpu_warn_fallback_once(__func__, node, op_supported);
+        const struct ggml_tensor * node) {
+    GGML_UNUSED(node);
     llama_graph_exec_log_set_current_node_fallback(true);
 
     llama_graph_exec_log_suspend_node_done();
@@ -984,9 +999,9 @@ static enum ggml_status ggml_backend_awnpu_compute_node(
     }
 
     if (!ggml_backend_awnpu_op_supported(node->op)) {
-        GGML_LOG_WARN("%s: op %d not supported, falling back to CPU\n", __func__, node->op);
-        return ggml_backend_awnpu_fallback_cpu_node(
-                ctx, cgraph, node_idx, node, false);
+        ggml_backend_awnpu_warn_fallback_once(
+                __func__, node, "AWNPU op not in supported list", GGML_STATUS_SUCCESS);
+        return ggml_backend_awnpu_fallback_cpu_node(ctx, cgraph, node_idx, node);
     }
 
     const enum ggml_status status = ggml_backend_awnpu_forward_npu_node(ctx, node);
@@ -994,9 +1009,9 @@ static enum ggml_status ggml_backend_awnpu_compute_node(
         return status;
     }
 
-    GGML_LOG_WARN("%s: op %d not supported, falling back to CPU, status: %d\n", __func__, node->op, status);
-    return ggml_backend_awnpu_fallback_cpu_node(
-            ctx, cgraph, node_idx, node, true);
+    ggml_backend_awnpu_warn_fallback_once(
+            __func__, node, "NPU kernel returned error (check src/dst dtype vs kernel)", status);
+    return ggml_backend_awnpu_fallback_cpu_node(ctx, cgraph, node_idx, node);
 }
 
 static enum ggml_status ggml_backend_awnpu_graph_compute_npu(ggml_backend_t backend, struct ggml_cgraph * cgraph) {

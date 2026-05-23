@@ -1,5 +1,7 @@
 #pragma once
 
+// Model compute-graph node dispatch for the AWNPU backend (op support checks and kernel routing).
+
 #include "ggml-backend.h"
 #include "ggml.h"
 

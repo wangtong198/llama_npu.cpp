@@ -1,6 +1,6 @@
-#include "ggml-awnpu-ops.h"
+#include "ggml-awnpu-graph-node.h"
 
-#include "ggml-awnpu-kernels.h"
+#include "ggml-awnpu-kernels-native.h"
 #include "ggml-awnpu-layer-map.h"
 #include "ggml-impl.h"
 #include "ggml.h"
