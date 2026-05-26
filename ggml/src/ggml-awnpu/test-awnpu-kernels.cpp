@@ -5,7 +5,7 @@
 //       -L../../../build/awnpu-native/bin -lggml-base -lggml-cpu
 //       -Wl,-rpath,../../../build/awnpu-native/bin -o test-awnpu-kernels
 //
-// Or build via CMake with -DNATIVE_KERNELS=ON (see CMakeLists.txt).
+// Or build via CMake with -DKERNEL_TYPE=native (see CMakeLists.txt).
 
 #include "ggml-awnpu-kernels-native.h"
 #include "ggml-impl.h"   // ggml_get_op_params_i32

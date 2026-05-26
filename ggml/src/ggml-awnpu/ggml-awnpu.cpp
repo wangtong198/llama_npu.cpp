@@ -791,6 +791,24 @@ static bool ggml_backend_awnpu_device_supports_op(ggml_backend_dev_t dev, const 
         return true;
     }
 
+    if (op->op == GGML_OP_NORM || op->op == GGML_OP_RMS_NORM) {
+        const struct ggml_tensor * src0 = op->src[0];
+        if (src0 == nullptr) {
+            return false;
+        }
+
+        const bool is_float_type =
+            op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_BF16;
+
+        // Keep RMS_NORM/NORM on the same backend as the surrounding matmul path
+        // when the tensor layout is compatible. This mirrors the CUDA behavior
+        // where these ops are accepted directly and only constrained by layout.
+        return is_float_type &&
+               op->type == src0->type &&
+               ggml_is_contiguous_rows(op) &&
+               ggml_is_contiguous_rows(src0);
+    }
+
     if (ggml_backend_awnpu_op_has_npu_weights(op)) {
         return true;
     }

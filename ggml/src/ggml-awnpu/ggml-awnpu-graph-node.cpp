@@ -1,6 +1,13 @@
 #include "ggml-awnpu-graph-node.h"
 
+#if defined(GGML_AWNPU_KERNEL_TYPE_NATIVE)
 #include "ggml-awnpu-kernels-native.h"
+#elif defined(GGML_AWNPU_KERNEL_TYPE_AWNPU)
+#include "ggml-awnpu-kernels-npu.h"
+#else
+#error "KERNEL_TYPE must be native or awnpu when prebuilding the library"
+#endif
+
 #include "ggml-awnpu-layer-map.h"
 #include "ggml-impl.h"
 #include "ggml.h"

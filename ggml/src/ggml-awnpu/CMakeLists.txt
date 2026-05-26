@@ -6,19 +6,21 @@ set(GGML_SOURCES_AWNPU
     ggml-awnpu-layer-map.cpp
 )
 
-if (NATIVE_KERNELS)
-    message(STATUS "AWNPU: using native CPU reference op kernels")
+if (KERNEL_TYPE STREQUAL "native")
+    message(STATUS "AWNPU: using native CPU reference op kernels implementated by pure C/C++")
     list(APPEND GGML_SOURCES_AWNPU ggml-awnpu-kernels-native.cpp)
+elseif (KERNEL_TYPE STREQUAL "awnpu")
+    message(STATUS "AWNPU: using awnpu op kernels")
+    list(APPEND GGML_SOURCES_AWNPU ggml-awnpu-kernels-npu.cpp)
 else()
-    message(STATUS "AWNPU: native op kernels disabled (stub implementations)")
-    list(APPEND GGML_SOURCES_AWNPU ggml-awnpu-kernels-stub.cpp)
+    message(FATAL_ERROR "AWNPU: unsupported KERNEL_TYPE='${KERNEL_TYPE}' (expected awnpu or native)")
 endif()
 
 set(GGML_HEADERS_AWNPU
     ggml-awnpu-graph-node.h
     ggml-awnpu-kernels-native.h
+    ggml-awnpu-kernels-npu.h
     ggml-awnpu-layer-map.h
-    ggml-awnpu-names.h
 )
 
 ggml_add_backend_library(ggml-awnpu
@@ -28,9 +30,13 @@ ggml_add_backend_library(ggml-awnpu
 
 target_include_directories(ggml-awnpu PRIVATE ${CMAKE_SOURCE_DIR}/include)
 
-if (NATIVE_KERNELS)
-    target_compile_definitions(ggml-awnpu PRIVATE NATIVE_KERNELS)
+if (KERNEL_TYPE STREQUAL "native")
+    target_compile_definitions(ggml-awnpu PRIVATE GGML_AWNPU_KERNEL_TYPE_NATIVE)
+elseif (KERNEL_TYPE STREQUAL "awnpu")
+    target_compile_definitions(ggml-awnpu PRIVATE GGML_AWNPU_KERNEL_TYPE_AWNPU)
+endif()
 
+if (KERNEL_TYPE STREQUAL "native")
     # Correctness test: compare native kernel outputs against CPU reference.
     add_executable(test-awnpu-kernels test-awnpu-kernels.cpp)
     target_include_directories(test-awnpu-kernels PRIVATE

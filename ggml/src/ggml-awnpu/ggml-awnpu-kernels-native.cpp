@@ -44,50 +44,53 @@ static inline bool is_float_type(ggml_type t) {
 static enum ggml_status copy_same_type(struct ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
 
-    const int64_t ne0 = dst->ne[0], ne1 = dst->ne[1],
-                  ne2 = dst->ne[2], ne3 = dst->ne[3];
+    const int64_t ne0 = src0->ne[0], ne1 = src0->ne[1],
+                  ne2 = src0->ne[2], ne3 = src0->ne[3];
     const size_t nb00 = src0->nb[0], nb01 = src0->nb[1],
                  nb02 = src0->nb[2], nb03 = src0->nb[3];
-    const size_t nb0  = dst->nb[0],  nb1  = dst->nb[1],
-                 nb2  = dst->nb[2],  nb3  = dst->nb[3];
 
     if (ggml_is_contiguous(src0) && ggml_is_contiguous(dst)) {
         memcpy(dst->data, src0->data, ggml_nbytes(dst));
         return GGML_STATUS_SUCCESS;
     }
 
-    if (!ggml_are_same_shape(src0, dst)) {
+    if (ggml_nelements(src0) != ggml_nelements(dst)) {
         return GGML_STATUS_FAILED;
     }
 
     const size_t type_size = ggml_type_size(src0->type);
-    if (nb00 != type_size || nb0 != type_size) {
-        if (!ggml_is_quantized(src0->type)) {
-            for (int64_t i3 = 0; i3 < ne3; ++i3)
-            for (int64_t i2 = 0; i2 < ne2; ++i2)
-            for (int64_t i1 = 0; i1 < ne1; ++i1)
-            for (int64_t i0 = 0; i0 < ne0; ++i0) {
-                const size_t src_off = i0*nb00 + i1*nb01 + i2*nb02 + i3*nb03;
-                const size_t dst_off = i0*nb0  + i1*nb1  + i2*nb2  + i3*nb3;
-                memcpy((char *) dst->data + dst_off, (const char *) src0->data + src_off, type_size);
+    if (ggml_is_contiguous(dst)) {
+        size_t id = 0;
+        char * dst_ptr = (char *) dst->data;
+        const size_t rs = ggml_row_size(src0->type, src0->ne[0]);
+
+        if (nb00 == type_size) {
+            for (int64_t i3 = 0; i3 < ne3; ++i3) {
+                for (int64_t i2 = 0; i2 < ne2; ++i2) {
+                    for (int64_t i1 = 0; i1 < ne1; ++i1) {
+                        const char * src_ptr = (const char *) src0->data + i1*nb01 + i2*nb02 + i3*nb03;
+                        memcpy(dst_ptr + id, src_ptr, rs);
+                        id += rs;
+                    }
+                }
             }
-            return GGML_STATUS_SUCCESS;
+        } else {
+            for (int64_t i3 = 0; i3 < ne3; ++i3) {
+                for (int64_t i2 = 0; i2 < ne2; ++i2) {
+                    for (int64_t i1 = 0; i1 < ne1; ++i1) {
+                        for (int64_t i0 = 0; i0 < ne0; ++i0) {
+                            const char * src_ptr = (const char *) src0->data + i0*nb00 + i1*nb01 + i2*nb02 + i3*nb03;
+                            memcpy(dst_ptr + id, src_ptr, type_size);
+                            id += type_size;
+                        }
+                    }
+                }
+            }
         }
-        return GGML_STATUS_FAILED;
+        return GGML_STATUS_SUCCESS;
     }
 
-    const size_t row_size = ggml_row_size(src0->type, ne0);
-
-    for (int64_t i3 = 0; i3 < ne3; ++i3)
-    for (int64_t i2 = 0; i2 < ne2; ++i2)
-    for (int64_t i1 = 0; i1 < ne1; ++i1) {
-        memcpy(
-            (char *) dst->data + i1*nb1 + i2*nb2 + i3*nb3,
-            (const char *) src0->data + i1*nb01 + i2*nb02 + i3*nb03,
-            row_size);
-    }
-
-    return GGML_STATUS_SUCCESS;
+    return GGML_STATUS_FAILED;
 }
 
 static enum ggml_status copy_i32_and_float(struct ggml_tensor * dst) {
